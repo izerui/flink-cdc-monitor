@@ -1,0 +1,24 @@
+[mysql]
+host = 192.168.1.100
+port = 3306
+databases = xxx
+username = xxx
+password = xxx
+ignored_table_prefixes = __spliting_,__temp_,__backup_,customer_supply_demand
+
+[postgresql]
+host = 192.168.1.100
+port = 5432
+database = xxx
+username = xxx
+password = xxx
+
+[monitor]
+# 刷新间隔，单位秒
+refresh_interval = 2
+# 最大显示表数
+max_tables_display = 100
+# 是否启用清屏
+enable_clear_screen = true
+# MySQL更新间隔，单位秒
+mysql_update_interval = 5
