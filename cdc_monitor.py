@@ -215,6 +215,10 @@ class PostgreSQLMonitor:
         self.mysql_update_lock = threading.Lock()
         self.mysql_update_futures = []  # 跟踪正在进行的MySQL更新任务
 
+        # 进度跟踪 - 用于计算同步速度和预估时间
+        self.history_data = []  # 存储历史数据: [(时间戳, pg_total, mysql_total, pg_change)]
+        self.max_history_points = 20  # 保留最近20个数据点用于计算速度
+
         # 信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -810,6 +814,278 @@ class PostgreSQLMonitor:
         combined_content = stats_text
         return Panel(combined_content, title="监控统计", box=box.ROUNDED, style="green")
 
+    def create_footer_panel(self, tables: List[TableInfo]) -> Panel:
+        """创建底部面板"""
+        consistent_count = len([t for t in tables if t.is_consistent])
+        inconsistent_count = len(tables) - consistent_count
+        max_display = self.monitor_config['max_tables_display']
+
+        footer_text = Text()
+        
+        # 第一行：进度条
+        # 过滤掉错误状态的表进行统计
+        valid_tables = [t for t in tables if t.pg_rows != -1 and t.mysql_rows != -1]
+        
+        if valid_tables:
+            total_pg_rows = sum(t.pg_rows for t in valid_tables)
+            total_mysql_rows = sum(t.mysql_rows for t in valid_tables)
+            
+            # 计算完成百分比 - PostgreSQL追赶MySQL的进度
+            if total_mysql_rows > 0:
+                completion_rate = min(total_pg_rows / total_mysql_rows, 1.0)
+            else:
+                completion_rate = 1.0 if total_pg_rows == 0 else 0.0
+            
+            completion_percent = completion_rate * 100
+            
+            # 计算速度
+            speed = self.calculate_sync_speed()
+            
+            # 估算剩余时间
+            remaining_time = self.estimate_remaining_time(total_mysql_rows, total_pg_rows, speed)
+            
+            # 创建进度条
+            bar_width = 25  # 稍微小一点以适应底部面板
+            filled_width = int(bar_width * completion_rate)
+            empty_width = bar_width - filled_width
+            
+            footer_text.append("📊 同步进度: ", style="bold cyan")
+            footer_text.append("█" * filled_width, style="green")  # 已完成部分
+            footer_text.append("░" * empty_width, style="dim")     # 未完成部分
+            footer_text.append(f" {completion_percent:.1f}%", style="white")
+            footer_text.append(f" ({total_pg_rows:,}/{total_mysql_rows:,})", style="cyan")
+            
+            # 速度和预估时间
+            if speed > 0:
+                footer_text.append(f" | 速度: {speed:.1f} 记录/秒", style="yellow")
+            else:
+                footer_text.append(" | 速度: 计算中...", style="dim")
+            
+            if speed > 0 and total_mysql_rows > total_pg_rows:
+                footer_text.append(f" | 预估: {remaining_time}", style="magenta")
+            elif total_pg_rows >= total_mysql_rows:
+                footer_text.append(" | 状态: 已完成", style="green")
+            else:
+                footer_text.append(" | 预估: 计算中...", style="dim")
+            
+            footer_text.append("\n")
+        else:
+            footer_text.append("📊 同步进度: ", style="bold cyan")
+            footer_text.append("等待数据...\n", style="dim")
+        
+        # 第二行：数据一致性统计
+        footer_text.append("🔍 数据一致性: ", style="bold")
+        footer_text.append(f"{consistent_count} 个表一致, ", style="green")
+        footer_text.append(f"{inconsistent_count} 个表不一致 ", style="red")
+        footer_text.append(f"(显示前 {min(len(tables), max_display)}/{len(tables)} 个表)\n", style="dim")
+        
+        # 第三行：图例和操作提示
+        footer_text.append("📋 图例: ✅数据一致 ⚠️数据不一致 ❌查询错误 | ~估计值\n", style="dim")
+        footer_text.append("🔄 MySQL状态: ", style="dim")
+        footer_text.append("[green]绿色=已更新[/green] [yellow]黄色=更新中[/yellow] [red]红色=未更新[/red] | ",
+                           style="dim")
+        footer_text.append("💡 按 Ctrl+C 停止监控", style="yellow")
+
+        return Panel(footer_text, box=box.ROUNDED, style="dim")
+
+    def create_layout(self, tables: List[TableInfo]) -> Layout:
+        """创建布局"""
+        layout = Layout()
+
+        layout.split_column(
+            Layout(self.create_header_panel(), size=3),
+            Layout(self.create_combined_stats_panel(tables), size=6),
+            Layout(self.create_tables_table(tables), name="tables"),
+            Layout(self.create_footer_panel(tables), size=6)
+        )
+
+        return layout
+
+    def run(self):
+        """运行监控"""
+        if not self.load_config():
+            return
+
+        self.console.print("[green]正在启动PostgreSQL监控程序...[/green]")
+
+        # 初始化数据库连接测试
+        pg_conn = self.connect_postgresql()
+        if not pg_conn:
+            return
+        pg_conn.close()
+
+        self.console.print(f"[green]配置的MySQL数据库: {', '.join(self.mysql_config.databases)}[/green]")
+        self.console.print(f"[green]开始监控，PG刷新间隔: {self.monitor_config['refresh_interval']} 秒[/green]")
+        self.console.print(f"[green]MySQL更新间隔: {self.mysql_update_interval} 次PG更新 (异步执行，不阻塞PG查询)[/green]")
+
+        # 初始化表结构 - 显示进度提示
+        self.console.print("[yellow]正在初始化表结构，请稍候...[/yellow]")
+        
+        with self.console.status("[bold green]正在从MySQL获取表信息...") as status:
+            target_tables = self.initialize_tables_from_mysql()
+            
+        # 显示初始化结果
+        total_tables = sum(len(tables_dict) for tables_dict in target_tables.values())
+        if total_tables > 0:
+            self.console.print(f"[green]✅ 初始化完成！发现 {total_tables} 个目标表[/green]")
+        else:
+            self.console.print("[red]❌ 未发现任何表，请检查配置[/red]")
+            return
+
+        # 第一次PostgreSQL更新
+        pg_conn = self.connect_postgresql()
+        if pg_conn:
+            self.get_postgresql_rows_from_pg_stat(pg_conn, target_tables)
+            pg_conn.close()
+            self.first_pg_update = False
+        
+        # 第一次MySQL更新
+        self.mysql_iteration += 1
+        self.update_mysql_counts(target_tables, use_information_schema=True)
+        self.first_mysql_update = False
+        
+        # 给用户3秒时间查看初始化信息
+        time.sleep(3)
+
+        # 主监控循环
+        try:
+            with Live(console=self.console, refresh_per_second=1, screen=True) as live:
+                while not self.stop_event.is_set():
+                    try:
+                        self.iteration += 1
+
+                        # 1. 更新PostgreSQL记录数（每次都更新）
+                        self.pg_iteration += 1
+                        pg_conn = self.connect_postgresql()
+                        if pg_conn:
+                            # 后续都使用精确的COUNT查询（首次已经在初始化时完成）
+                            self.update_postgresql_counts(pg_conn, target_tables)
+                            pg_conn.close()
+
+                        # 2. 按间隔更新MySQL记录数（异步，不阻塞PostgreSQL查询）
+                        if self.pg_iteration % self.mysql_update_interval == 0:
+                            self.mysql_iteration += 1
+                            # 使用异步更新，不阻塞主循环
+                            self.update_mysql_counts_async(target_tables, use_information_schema=False)
+
+                        # 3. 将结果转换为列表格式用于显示
+                        self.tables = []
+                        for schema_name, tables_dict in target_tables.items():
+                            for table_info in tables_dict.values():
+                                self.tables.append(table_info)
+
+                        # 4. 更新进度跟踪数据
+                        self.update_progress_data(self.tables)
+
+                        # 5. 更新显示
+                        live.update(self.create_layout(self.tables))
+
+                        # 等待下次刷新（可被中断）
+                        for _ in range(self.monitor_config['refresh_interval']):
+                            if self.stop_event.is_set():
+                                break
+                            time.sleep(1)
+
+                    except KeyboardInterrupt:
+                        # 在循环中捕获KeyboardInterrupt，确保能够退出
+                        break
+                    except Exception as e:
+                        if not self.stop_event.is_set():
+                            self.console.print(f"[red]监控过程中出错: {e}[/red]")
+                            time.sleep(5)
+                
+        finally:
+            # 确保线程池被关闭
+            self.console.print("[dim]正在清理资源...[/dim]")
+            if hasattr(self, 'mysql_executor'):
+                # 再次尝试关闭线程池，这次等待最多2秒
+                try:
+                    self.mysql_executor.shutdown(wait=False)
+                    # 给线程池2秒时间优雅关闭
+                    time.sleep(2)
+                except:
+                    pass
+            self.console.print("[green]资源清理完成[/green]")
+
+    def update_progress_data(self, tables: List[TableInfo]):
+        """更新进度数据，计算总数和变化量"""
+        current_time = datetime.now()
+        
+        # 过滤掉错误状态的表进行统计
+        valid_tables = [t for t in tables if t.pg_rows != -1 and t.mysql_rows != -1]
+        
+        total_pg_rows = sum(t.pg_rows for t in valid_tables)
+        total_mysql_rows = sum(t.mysql_rows for t in valid_tables)
+        total_pg_change = sum(t.change for t in valid_tables)
+        
+        # 添加到历史数据
+        self.history_data.append((current_time, total_pg_rows, total_mysql_rows, total_pg_change))
+        
+        # 保持历史数据在指定范围内
+        if len(self.history_data) > self.max_history_points:
+            self.history_data.pop(0)
+
+    def calculate_sync_speed(self) -> float:
+        """计算同步速度（记录/秒）"""
+        if len(self.history_data) < 2:
+            return 0.0
+        
+        # 使用最近的数据点计算速度
+        recent_data = self.history_data[-min(10, len(self.history_data)):]
+        
+        if len(recent_data) < 2:
+            return 0.0
+        
+        # 计算时间跨度和总变化量
+        time_span = (recent_data[-1][0] - recent_data[0][0]).total_seconds()
+        if time_span <= 0:
+            return 0.0
+        
+        # 计算PostgreSQL总变化量（所有数据点的变化量之和）
+        total_change = sum(data[3] for data in recent_data if data[3] > 0)  # 只计算正向变化
+        
+        return total_change / time_span if time_span > 0 else 0.0
+
+    def estimate_remaining_time(self, pg_total: int, mysql_total: int, speed: float) -> str:
+        """估算剩余时间"""
+        if speed <= 0 or pg_total <= mysql_total:
+            return "无法估算"
+        
+        remaining_records = pg_total - mysql_total
+        remaining_seconds = remaining_records / speed
+        
+        if remaining_seconds < 60:
+            return f"{int(remaining_seconds)}秒"
+        elif remaining_seconds < 3600:
+            minutes = int(remaining_seconds // 60)
+            seconds = int(remaining_seconds % 60)
+            return f"{minutes}分{seconds}秒"
+        elif remaining_seconds < 86400:
+            hours = int(remaining_seconds // 3600)
+            minutes = int((remaining_seconds % 3600) // 60)
+            return f"{hours}小时{minutes}分钟"
+        else:
+            days = int(remaining_seconds // 86400)
+            hours = int((remaining_seconds % 86400) // 3600)
+            return f"{days}天{hours}小时"
+
+    def format_duration(self, seconds: float) -> str:
+        """格式化时长显示"""
+        if seconds < 60:
+            return f"{int(seconds)}秒"
+        elif seconds < 3600:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}分{secs}秒"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}小时{minutes}分钟"
+        else:
+            days = int(seconds // 86400)
+            hours = int((seconds % 86400) // 3600)
+            return f"{days}天{hours}小时"
+
     def create_tables_table(self, tables: List[TableInfo]) -> Table:
         """创建表格"""
 
@@ -924,146 +1200,6 @@ class PostgreSQLMonitor:
             )
 
         return table
-
-    def create_footer_panel(self, tables: List[TableInfo]) -> Panel:
-        """创建底部面板"""
-        consistent_count = len([t for t in tables if t.is_consistent])
-        inconsistent_count = len(tables) - consistent_count
-        max_display = self.monitor_config['max_tables_display']
-
-        footer_text = Text()
-        footer_text.append("🔍 数据一致性: ", style="bold")
-        footer_text.append(f"{consistent_count} 个表一致, ", style="green")
-        footer_text.append(f"{inconsistent_count} 个表不一致 ", style="red")
-        footer_text.append(f"(显示前 {min(len(tables), max_display)}/{len(tables)} 个表)\n", style="dim")
-        footer_text.append("📋 图例: ✅数据一致 ⚠️数据不一致 ❌查询错误 | ~估计值\n", style="dim")
-        footer_text.append("🔄 MySQL状态: ", style="dim")
-        footer_text.append("[green]绿色=已更新[/green] [yellow]黄色=更新中[/yellow] [red]红色=未更新[/red] | ",
-                           style="dim")
-        footer_text.append("💡 按 Ctrl+C 停止监控", style="yellow")
-
-        return Panel(footer_text, box=box.ROUNDED, style="dim")
-
-    def create_layout(self, tables: List[TableInfo]) -> Layout:
-        """创建布局"""
-        layout = Layout()
-
-        layout.split_column(
-            Layout(self.create_header_panel(), size=3),
-            Layout(self.create_combined_stats_panel(tables), size=6),
-            Layout(self.create_tables_table(tables), name="tables"),
-            Layout(self.create_footer_panel(tables), size=4)
-        )
-
-        return layout
-
-    def run(self):
-        """运行监控"""
-        if not self.load_config():
-            return
-
-        self.console.print("[green]正在启动PostgreSQL监控程序...[/green]")
-
-        # 初始化数据库连接测试
-        pg_conn = self.connect_postgresql()
-        if not pg_conn:
-            return
-        pg_conn.close()
-
-        self.console.print(f"[green]配置的MySQL数据库: {', '.join(self.mysql_config.databases)}[/green]")
-        self.console.print(f"[green]开始监控，PG刷新间隔: {self.monitor_config['refresh_interval']} 秒[/green]")
-        self.console.print(f"[green]MySQL更新间隔: {self.mysql_update_interval} 次PG更新 (异步执行，不阻塞PG查询)[/green]")
-
-        # 初始化表结构 - 显示进度提示
-        self.console.print("[yellow]正在初始化表结构，请稍候...[/yellow]")
-        
-        with self.console.status("[bold green]正在从MySQL获取表信息...") as status:
-            target_tables = self.initialize_tables_from_mysql()
-            
-        # 显示初始化结果
-        total_tables = sum(len(tables_dict) for tables_dict in target_tables.values())
-        if total_tables > 0:
-            self.console.print(f"[green]✅ 初始化完成！发现 {total_tables} 个目标表[/green]")
-        else:
-            self.console.print("[red]❌ 未发现任何表，请检查配置[/red]")
-            return
-
-        # 立即进行第一次数据更新（使用快速查询）
-        self.console.print("[yellow]正在进行首次数据更新（MySQL使用information_schema，PostgreSQL使用pg_stat）...[/yellow]")
-        
-        # 第一次PostgreSQL更新
-        pg_conn = self.connect_postgresql()
-        if pg_conn:
-            self.get_postgresql_rows_from_pg_stat(pg_conn, target_tables)
-            pg_conn.close()
-            self.first_pg_update = False
-        
-        # 第一次MySQL更新
-        self.mysql_iteration += 1
-        self.update_mysql_counts(target_tables, use_information_schema=True)
-        self.first_mysql_update = False
-        
-        self.console.print(f"[green]✅ 首次数据更新完成 (MySQL第{self.mysql_iteration}次)[/green]")
-        
-        # 给用户3秒时间查看初始化信息
-        time.sleep(3)
-
-        # 主监控循环
-        try:
-            with Live(console=self.console, refresh_per_second=1, screen=True) as live:
-                while not self.stop_event.is_set():
-                    try:
-                        self.iteration += 1
-
-                        # 1. 更新PostgreSQL记录数（每次都更新）
-                        self.pg_iteration += 1
-                        pg_conn = self.connect_postgresql()
-                        if pg_conn:
-                            # 后续都使用精确的COUNT查询（首次已经在初始化时完成）
-                            self.update_postgresql_counts(pg_conn, target_tables)
-                            pg_conn.close()
-
-                        # 2. 按间隔更新MySQL记录数（异步，不阻塞PostgreSQL查询）
-                        if self.pg_iteration % self.mysql_update_interval == 0:
-                            self.mysql_iteration += 1
-                            # 使用异步更新，不阻塞主循环
-                            self.update_mysql_counts_async(target_tables, use_information_schema=False)
-
-                        # 3. 将结果转换为列表格式用于显示
-                        self.tables = []
-                        for schema_name, tables_dict in target_tables.items():
-                            for table_info in tables_dict.values():
-                                self.tables.append(table_info)
-
-                        # 4. 更新显示
-                        live.update(self.create_layout(self.tables))
-
-                        # 等待下次刷新（可被中断）
-                        for _ in range(self.monitor_config['refresh_interval']):
-                            if self.stop_event.is_set():
-                                break
-                            time.sleep(1)
-
-                    except KeyboardInterrupt:
-                        # 在循环中捕获KeyboardInterrupt，确保能够退出
-                        break
-                    except Exception as e:
-                        if not self.stop_event.is_set():
-                            self.console.print(f"[red]监控过程中出错: {e}[/red]")
-                            time.sleep(5)
-                
-        finally:
-            # 确保线程池被关闭
-            self.console.print("[dim]正在清理资源...[/dim]")
-            if hasattr(self, 'mysql_executor'):
-                # 再次尝试关闭线程池，这次等待最多2秒
-                try:
-                    self.mysql_executor.shutdown(wait=False)
-                    # 给线程池2秒时间优雅关闭
-                    time.sleep(2)
-                except:
-                    pass
-            self.console.print("[green]资源清理完成[/green]")
 
 
 def main():
