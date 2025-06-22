@@ -10,6 +10,7 @@ import signal
 import sys
 import re
 import threading
+import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -187,9 +188,10 @@ class SyncProperties:
 class PostgreSQLMonitor:
     """PostgreSQL监控器"""
 
-    def __init__(self, config_file: str = "config.ini"):
+    def __init__(self, config_file: str = "config.ini", override_databases: Optional[List[str]] = None):
         self.console = Console()
         self.config_file = config_file
+        self.override_databases = override_databases  # 命令行传入的数据库列表
         self.pg_config = None
         self.mysql_config = None
         self.monitor_config = {}
@@ -274,13 +276,22 @@ class PostgreSQLMonitor:
 
             # MySQL配置
             mysql_section = config['mysql']
+            
+            # 如果有命令行传入的数据库列表，使用它覆盖配置文件
+            if self.override_databases:
+                databases_list = self.override_databases
+                self.console.print(f"[yellow]使用命令行指定的数据库: {', '.join(databases_list)}[/yellow]")
+            else:
+                databases_list = mysql_section['databases'].split(',')
+                self.console.print(f"[yellow]使用配置文件中的数据库: {', '.join(databases_list)}[/yellow]")
+            
             self.mysql_config = MySQLConfig(
                 host=mysql_section['host'],
                 port=int(mysql_section['port']),
                 database="",  # 会动态切换
                 username=mysql_section['username'],
                 password=mysql_section['password'],
-                databases=mysql_section['databases'].split(','),
+                databases=databases_list,
                 ignored_prefixes=mysql_section.get('ignored_table_prefixes', '').split(',')
             )
 
@@ -1004,14 +1015,51 @@ class PostgreSQLMonitor:
 
 def main():
     """主函数"""
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(
+        description="PostgreSQL数据库监控工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例用法:
+  python3 cdc_monitor.py                          # 使用配置文件中的数据库列表
+  python3 cdc_monitor.py --databases db1,db2     # 监控指定的数据库
+  python3 cdc_monitor.py -d test_db               # 只监控test_db数据库
+  python3 cdc_monitor.py --config my_config.ini  # 使用指定的配置文件
+        """
+    )
+    
+    parser.add_argument(
+        '--databases', '-d',
+        type=str,
+        help='指定要监控的MySQL数据库列表（逗号分隔），覆盖配置文件中的databases配置'
+    )
+    
+    parser.add_argument(
+        '--config', '-c',
+        type=str,
+        default="config.ini",
+        help='指定配置文件路径（默认: config.ini）'
+    )
+    
+    args = parser.parse_args()
+    
     # 检查配置文件是否存在
-    config_file = "config.ini"
+    config_file = args.config
     if not Path(config_file).exists():
         print(f"❌ 配置文件不存在: {config_file}")
         print("请确保config.ini文件存在并配置正确")
         sys.exit(1)
 
-    monitor = PostgreSQLMonitor(config_file)
+    # 处理数据库列表参数
+    override_databases = None
+    if args.databases:
+        # 去除空格并分割数据库名称
+        override_databases = [db.strip() for db in args.databases.split(',') if db.strip()]
+        if not override_databases:
+            print("❌ 指定的数据库列表为空")
+            sys.exit(1)
+
+    monitor = PostgreSQLMonitor(config_file, override_databases)
     monitor.run()
 
 
