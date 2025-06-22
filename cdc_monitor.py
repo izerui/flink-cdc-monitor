@@ -30,6 +30,7 @@ from rich.columns import Columns
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import box
 from rich.align import Align
+from rich.theme import Theme
 
 
 @dataclass
@@ -189,7 +190,38 @@ class PostgreSQLMonitor:
     """PostgreSQL监控器"""
 
     def __init__(self, config_file: str = "config.ini", override_databases: Optional[List[str]] = None):
-        self.console = Console()
+        # 定义颜色主题 - 白色背景专业监控界面风格
+        self.theme = Theme({
+            # 基础状态颜色 - 确保白色背景下的高对比度
+            "success": "bold green",        # 健康/正常状态 - 绿色粗体
+            "error": "bold red",            # 错误/危险状态 - 红色粗体
+            "warning": "bold yellow",       # 警告状态 - 黄色粗体
+            "info": "bright_blue",          # 信息提示 - 亮蓝色
+            "normal": "black",              # 普通文本 - 黑色（白背景下可读）
+            "dim_text": "bright_black",     # 次要信息 - 亮黑色（灰色效果）
+            
+            # 数据状态颜色 - 语义化状态指示
+            "consistent": "bold green",     # 数据一致 - 绿色粗体
+            "inconsistent": "bold red",     # 数据不一致 - 红色粗体  
+            "updating": "bold yellow",      # 更新中 - 黄色粗体
+            "unchanged": "black",           # 无变化 - 黑色
+            
+            # 界面元素颜色 - 专业监控风格
+            "header": "bold blue",          # 主标题 - 深蓝色粗体，权威感
+            "panel_border": "blue",         # 主边框 - 蓝色边框
+            "stats_border": "bold cyan",    # 统计边框 - 青色粗体边框
+            "footer_border": "bright_black", # 底部边框 - 亮黑色
+            "table_header": "bold white on black", # 表头 - 黑底白字，醒目
+            
+            # 数据字段颜色 - 清晰的数据展示
+            "schema_name": "magenta",       # Schema名称 - 洋红色
+            "table_name": "blue",           # 表名 - 蓝色
+            "progress": "bright_blue",      # 进度信息 - 亮蓝色
+            "speed": "bright_blue",         # 速度指标 - 亮蓝色
+            "estimate": "dim blue"          # 估算信息 - 暗蓝色
+        })
+        
+        self.console = Console(theme=self.theme)
         self.config_file = config_file
         self.override_databases = override_databases  # 命令行传入的数据库列表
         self.pg_config = None
@@ -206,6 +238,7 @@ class PostgreSQLMonitor:
         self.mysql_update_interval = 3  # MySQL更新间隔（相对于PostgreSQL）
         self.first_mysql_update = True  # 标记是否是第一次MySQL更新
         self.first_pg_update = True  # 标记是否是第一次PostgreSQL更新
+        self.pg_updating = False  # PostgreSQL是否正在更新中
         
         # 停止标志，用于优雅退出
         self.stop_event = threading.Event()
@@ -253,14 +286,14 @@ class PostgreSQLMonitor:
 
     def _signal_handler(self, signum, frame):
         """信号处理器 - 快速响应，不等待长时间任务"""
-        self.console.print("\n[yellow]正在停止监控程序...[/yellow]")
+        self.console.print("\n[bold yellow]正在停止监控程序...[/bold yellow]")  # 警告状态 - 黄色粗体
         
         # 设置停止标志
         self.stop_event.set()
         
         # 立即关闭线程池，不等待正在执行的任务完成
         if hasattr(self, 'mysql_executor'):
-            self.console.print("[dim]强制关闭MySQL查询线程...[/dim]")
+            self.console.print("[bright_black]强制关闭MySQL查询线程...[/bright_black]")  # 次要信息 - 亮黑色
             # 使用shutdown(wait=False)立即关闭，不等待正在执行的任务
             self.mysql_executor.shutdown(wait=False)
             
@@ -269,14 +302,14 @@ class PostgreSQLMonitor:
                 if not future.done():
                     future.cancel()
         
-        self.console.print("[yellow]监控程序已停止[/yellow]")
+        self.console.print("[bold yellow]监控程序已停止[/bold yellow]")  # 警告状态 - 黄色粗体
         sys.exit(0)
 
     def load_config(self) -> bool:
         """加载配置文件"""
         config_path = Path(self.config_file)
         if not config_path.exists():
-            self.console.print(f"[red]配置文件不存在: {config_path}[/red]")
+            self.console.print(f"[bold red]配置文件不存在: {config_path}[/bold red]")  # 错误状态 - 红色粗体
             return False
 
         try:
@@ -299,10 +332,10 @@ class PostgreSQLMonitor:
             # 如果有命令行传入的数据库列表，使用它覆盖配置文件
             if self.override_databases:
                 databases_list = self.override_databases
-                self.console.print(f"[yellow]使用命令行指定的数据库: {', '.join(databases_list)}[/yellow]")
+                self.console.print(f"[bright_blue]使用命令行指定的数据库: {', '.join(databases_list)}[/bright_blue]")  # 信息提示 - 亮蓝色
             else:
                 databases_list = mysql_section['databases'].split(',')
-                self.console.print(f"[yellow]使用配置文件中的数据库: {', '.join(databases_list)}[/yellow]")
+                self.console.print(f"[bright_blue]使用配置文件中的数据库: {', '.join(databases_list)}[/bright_blue]")  # 信息提示 - 亮蓝色
             
             self.mysql_config = MySQLConfig(
                 host=mysql_section['host'],
@@ -329,7 +362,7 @@ class PostgreSQLMonitor:
             return True
 
         except Exception as e:
-            self.console.print(f"[red]配置文件加载失败: {e}[/red]")
+            self.console.print(f"[bold red]配置文件加载失败: {e}[/bold red]")  # 错误状态 - 红色粗体
             return False
 
     def connect_postgresql(self) -> Optional[psycopg2.extensions.connection]:
@@ -618,54 +651,62 @@ class PostgreSQLMonitor:
     def get_postgresql_rows_from_pg_stat(self, conn, target_tables: Dict[str, Dict[str, TableInfo]]):
         """第一次运行时使用pg_stat_user_tables快速获取PostgreSQL表行数估计值"""
         current_time = datetime.now()
+        self.pg_updating = True
 
-        for schema_name, tables_dict in target_tables.items():
-            try:
-                with conn.cursor() as cursor:
-                    # 一次性获取该schema下所有表的统计信息
-                    cursor.execute("""
-                        SELECT relname, n_tup_ins - n_tup_del + n_tup_upd AS estimated_rows
-                        FROM pg_stat_user_tables 
-                        WHERE schemaname = %s
-                    """, (schema_name,))
-                    
-                    # 建立表名到估计行数的映射
-                    pg_stats_map = {}
-                    for row in cursor.fetchall():
-                        table_name, estimated_rows = row
-                        pg_stats_map[table_name] = max(0, estimated_rows or 0)  # 确保非负数
+        try:
+            for schema_name, tables_dict in target_tables.items():
+                try:
+                    with conn.cursor() as cursor:
+                        # 一次性获取该schema下所有表的统计信息
+                        cursor.execute("""
+                            SELECT relname, n_tup_ins - n_tup_del + n_tup_upd AS estimated_rows
+                            FROM pg_stat_user_tables 
+                            WHERE schemaname = %s
+                        """, (schema_name,))
+                        
+                        # 建立表名到估计行数的映射
+                        pg_stats_map = {}
+                        for row in cursor.fetchall():
+                            table_name, estimated_rows = row
+                            pg_stats_map[table_name] = max(0, estimated_rows or 0)  # 确保非负数
 
-                # 更新TableInfo
-                for target_table_name, table_info in tables_dict.items():
-                    if target_table_name in pg_stats_map:
-                        new_count = pg_stats_map[target_table_name]
-                    else:
-                        # 如果统计信息中没有，可能是新表或无数据，使用精确查询
-                        try:
-                            with conn.cursor() as cursor:
-                                cursor.execute(f'SELECT COUNT(*) FROM "{schema_name}"."{target_table_name}"')
-                                new_count = cursor.fetchone()[0]
-                        except:
-                            new_count = -1  # 查询失败标记为-1
+                    # 更新TableInfo
+                    for target_table_name, table_info in tables_dict.items():
+                        if target_table_name in pg_stats_map:
+                            new_count = pg_stats_map[target_table_name]
+                        else:
+                            # 如果统计信息中没有，可能是新表或无数据，使用精确查询
+                            try:
+                                with conn.cursor() as cursor:
+                                    cursor.execute(f'SELECT COUNT(*) FROM "{schema_name}"."{target_table_name}"')
+                                    new_count = cursor.fetchone()[0]
+                            except:
+                                new_count = -1  # 查询失败标记为-1
 
-                    if not table_info.is_first_query:
-                        table_info.previous_pg_rows = table_info.pg_rows
-                    else:
-                        table_info.previous_pg_rows = new_count
-                        table_info.is_first_query = False
+                        if not table_info.is_first_query:
+                            table_info.previous_pg_rows = table_info.pg_rows
+                        else:
+                            table_info.previous_pg_rows = new_count
+                            table_info.is_first_query = False
 
-                    table_info.pg_rows = new_count
-                    table_info.last_updated = current_time
-                    table_info.pg_is_estimated = True  # 标记为估计值
+                        table_info.pg_rows = new_count
+                        table_info.last_updated = current_time
+                        table_info.pg_is_estimated = True  # 标记为估计值
 
-            except Exception as e:
-                # 如果pg_stat查询失败，回退到逐表精确查询
-                self.update_postgresql_counts(conn, {schema_name: tables_dict})
+                except Exception as e:
+                    # 如果pg_stat查询失败，回退到逐表精确查询
+                    self.update_postgresql_counts(conn, {schema_name: tables_dict})
+        finally:
+            self.pg_updating = False
 
     def update_postgresql_counts(self, conn, target_tables: Dict[str, Dict[str, TableInfo]]):
         """更新PostgreSQL记录数（常规精确查询）"""
         current_time = datetime.now()
-        self._update_postgresql_counts_exact(conn, target_tables, current_time)
+        self.pg_updating = True
+        try:
+            self._update_postgresql_counts_exact(conn, target_tables, current_time)
+        finally:
+            self.pg_updating = False
 
     def _update_postgresql_counts_exact(self, conn, target_tables: Dict[str, Dict[str, TableInfo]], current_time):
         """使用精确COUNT查询更新PostgreSQL记录数"""
@@ -702,16 +743,16 @@ class PostgreSQLMonitor:
     def create_header_panel(self) -> Panel:
         """创建标题面板"""
         title_text = Text()
-        title_text.append("🔍 PostgreSQL 数据库监控", style="bold cyan")
-        title_text.append(f" - PG第{self.pg_iteration}次/MySQL第{self.mysql_iteration}次", style="dim")
+        title_text.append("🔍 PostgreSQL 数据库监控", style="header")  # 主标题 - 深蓝色粗体
+        title_text.append(f" - PG第{self.pg_iteration}次/MySQL第{self.mysql_iteration}次", style="dim_text")  # 副标题 - 暗灰色
 
         time_text = Text()
-        time_text.append("⏰ 运行时长: ", style="dim")
+        time_text.append("⏰ 运行时长: ", style="dim_text")  # 标签 - 暗灰色
         runtime_text = self.get_relative_time(self.start_time).rstrip("前")
-        time_text.append(runtime_text, style="green")
+        time_text.append(runtime_text, style="info")  # 时间显示 - 亮蓝色，重要信息
 
         header_content = Align.center(Columns([title_text, time_text], equal=True))
-        return Panel(header_content, box=box.ROUNDED, style="blue")
+        return Panel(header_content, box=box.ROUNDED, style="panel_border")
 
     def create_combined_stats_panel(self, tables: List[TableInfo]) -> Panel:
         """创建合并的统计面板"""
@@ -748,71 +789,61 @@ class PostgreSQLMonitor:
 
         # 统一的统计信息
         stats_text = Text()
-        stats_text.append("📊 监控统计: ", style="bold")
-        
-        # 第一行：基本统计和Schema信息
-        stats_text.append(f"{len(tables)} 个表", style="white")
-        
-        # 始终显示Schema详细信息
-        if schema_stats:
-            stats_text.append(f", {len(schema_stats)} 个 Schema: ", style="white")
-            schema_names = sorted(schema_stats.keys())
-            for i, schema_name in enumerate(schema_names):
-                if i > 0:
-                    stats_text.append(", ", style="white")
-                stats_text.append(f"{schema_name}", style="cyan")
-                # 显示每个schema的表数量
-                stats_text.append(f"({schema_stats[schema_name]['count']})", style="dim")
-        else:
-            stats_text.append(" (无Schema)", style="red")
-        stats_text.append("\n")
-        
         # 第二行：数据量统计
-        stats_text.append(f"📈 PG总计: {total_pg_rows:,} 行, ", style="white")
-        stats_text.append(f"MySQL总计: {total_mysql_rows:,} 行, ", style="white")
+        stats_text.append(f"📈 PG总计: ", style="normal")  # 标签 - 黑色
+        stats_text.append(f"{total_pg_rows:,}", style="dim_text")  # PG总数 - 浅色
+        stats_text.append(f" 行, MySQL总计: ", style="normal")  # 标签 - 黑色
+        stats_text.append(f"{total_mysql_rows:,}", style="normal")  # MySQL总数 - 正常色
+        stats_text.append(f" 行, ", style="normal")
         
-        diff_style = "red" if total_diff < 0 else "green" if total_diff > 0 else "white"
+        # 数据差异颜色语义化
+        diff_style = "inconsistent" if total_diff < 0 else "consistent" if total_diff > 0 else "normal"
         stats_text.append(f"数据差异: {total_diff:+,} 行\n", style=diff_style)
         
         # 第三行：变化和一致性统计
-        change_style = "green" if total_changes > 0 else "red" if total_changes < 0 else "white"
+        change_style = "consistent" if total_changes > 0 else "inconsistent" if total_changes < 0 else "normal"
         stats_text.append(f"🔄 本轮变化: {total_changes:+,} 行 ({changed_count} 个表有变化), ", style=change_style)
         
-        stats_text.append(f"一致性: ", style="white")
-        stats_text.append(f"{consistent_count} 个一致", style="green")
+        stats_text.append(f"一致性: ", style="normal")
+        stats_text.append(f"{consistent_count} 个一致", style="consistent")  # 一致状态 - 绿色粗体
         if inconsistent_count > 0:
-            stats_text.append(f", {inconsistent_count} 个不一致", style="red")
+            stats_text.append(f", {inconsistent_count} 个不一致", style="inconsistent")  # 不一致 - 红色粗体
         if len(error_tables) > 0:
-            stats_text.append(f", {len(error_tables)} 个错误", style="red")
+            stats_text.append(f", {len(error_tables)} 个错误", style="error")  # 错误 - 红色粗体
         
-        # 显示MySQL异步任务状态
+        # 显示更新状态
         mysql_updating_count = sum(1 for t in tables if t.mysql_updating)
         active_futures = len([f for f in self.mysql_update_futures if not f.done()])
-        if mysql_updating_count > 0 or active_futures > 0:
-            stats_text.append(f", MySQL更新中: {mysql_updating_count} 个表, {active_futures} 个任务", style="yellow")
         
-        # 如果有多个Schema，显示详细的Schema统计
-        if len(schema_stats) > 1:
-            stats_text.append("\n📋 Schema详情: ", style="bold")
-            for i, (schema_name, stats) in enumerate(sorted(schema_stats.items())):
-                if i > 0:
-                    stats_text.append(" | ", style="dim")
-                
-                # Schema名称和基本信息
-                stats_text.append(f"{schema_name}: ", style="cyan")
-                stats_text.append(f"{stats['count']}表 ", style="white")
-                
-                # 数据差异
-                schema_diff = stats['pg_rows'] - stats['mysql_rows']
-                diff_style = "red" if schema_diff < 0 else "green" if schema_diff > 0 else "white"
-                stats_text.append(f"差异{schema_diff:+,} ", style=diff_style)
-                
-                # 不一致表数量
-                if stats['inconsistent'] > 0:
-                    stats_text.append(f"({stats['inconsistent']}不一致)", style="red")
+        # PostgreSQL更新状态
+        if self.pg_updating:
+            stats_text.append(f", PG更新中", style="updating")  # 更新中 - 黄色粗体
+        
+        # MySQL更新状态
+        if mysql_updating_count > 0 or active_futures > 0:
+            stats_text.append(f", MySQL更新中: {mysql_updating_count} 个表, {active_futures} 个任务", style="updating")  # 更新中 - 黄色粗体
+        
+        # 显示详细的Schema统计
+        stats_text.append("\n📋 Schema详情: ", style="info")  # 子标题 - 亮蓝色
+        for i, (schema_name, stats) in enumerate(sorted(schema_stats.items())):
+            if i > 0:
+                stats_text.append(" | ", style="dim_text")  # 分隔符 - 暗灰色
+
+            # Schema名称和基本信息
+            stats_text.append(f"{schema_name}: ", style="schema_name")  # Schema名 - 洋红色
+            stats_text.append(f"{stats['count']}表 ", style="normal")  # 表数量 - 黑色
+
+            # 数据差异颜色语义化
+            schema_diff = stats['pg_rows'] - stats['mysql_rows']
+            diff_style = "inconsistent" if schema_diff < 0 else "consistent" if schema_diff > 0 else "info"
+            stats_text.append(f"差异{schema_diff:+,} ", style=diff_style)
+
+            # 不一致表数量
+            if stats['inconsistent'] > 0:
+                stats_text.append(f"({stats['inconsistent']}不一致)", style="inconsistent")  # 不一致 - 红色粗体
 
         combined_content = stats_text
-        return Panel(combined_content, title="监控统计", box=box.ROUNDED, style="green")
+        return Panel(combined_content, title="监控统计", box=box.ROUNDED, style="stats_border")
 
     def create_footer_panel(self, tables: List[TableInfo]) -> Panel:
         """创建底部面板"""
@@ -844,49 +875,57 @@ class PostgreSQLMonitor:
             # 估算剩余时间
             remaining_time = self.estimate_remaining_time(total_mysql_rows, total_pg_rows, speed)
             
-            # 创建进度条
+            # 创建进度条 - 根据完成度使用不同颜色
             bar_width = 25  # 稍微小一点以适应底部面板
             filled_width = int(bar_width * completion_rate)
             empty_width = bar_width - filled_width
             
-            footer_text.append("📊 同步进度: ", style="bold cyan")
-            footer_text.append("█" * filled_width, style="green")  # 已完成部分
-            footer_text.append("░" * empty_width, style="dim")     # 未完成部分
-            footer_text.append(f" {completion_percent:.1f}%", style="white")
-            footer_text.append(f" ({total_pg_rows:,}/{total_mysql_rows:,})", style="cyan")
+            # 进度条颜色语义化：根据完成率选择颜色
+            if completion_rate >= 0.8:
+                progress_color = "consistent"  # 80%以上 - 绿色粗体
+            elif completion_rate >= 0.6:
+                progress_color = "updating"    # 60-80% - 黄色粗体
+            else:
+                progress_color = "inconsistent"  # 60%以下 - 红色粗体
+            
+            footer_text.append("📊 同步进度: ", style="info")  # 标题 - 亮蓝色
+            footer_text.append("█" * filled_width, style=progress_color)  # 已完成部分
+            footer_text.append("░" * empty_width, style="dim_text")       # 未完成部分 - 暗灰色
+            footer_text.append(f" {completion_percent:.1f}%", style="info")  # 百分比 - 亮蓝色
+            footer_text.append(f" (", style="normal")  # 括号 - 黑色
+            footer_text.append(f"{total_pg_rows:,}", style="dim_text")  # PG总数 - 浅色
+            footer_text.append(f"/", style="normal")  # 分隔符 - 黑色
+            footer_text.append(f"{total_mysql_rows:,}", style="normal")  # MySQL总数 - 正常色
+            footer_text.append(f")", style="normal")  # 括号 - 黑色
             
             # 速度和预估时间
             if speed > 0:
-                footer_text.append(f" | 速度: {speed:.1f} 记录/秒", style="yellow")
+                footer_text.append(f" | 速度: {speed:.1f} 记录/秒", style="speed")  # 速度 - 亮蓝色
             else:
-                footer_text.append(" | 速度: 计算中...", style="dim")
+                footer_text.append(" | 速度: 计算中...", style="dim_text")  # 计算中 - 暗灰色
             
             if speed > 0 and total_mysql_rows > total_pg_rows:
-                footer_text.append(f" | 预估: {remaining_time}", style="magenta")
+                footer_text.append(f" | 预估: {remaining_time}", style="estimate")  # 预估时间 - 暗蓝色
             elif total_pg_rows >= total_mysql_rows:
-                footer_text.append(" | 状态: 已完成", style="green")
+                footer_text.append(" | 状态: 已完成", style="consistent")  # 完成状态 - 绿色粗体
             else:
-                footer_text.append(" | 预估: 计算中...", style="dim")
+                footer_text.append(" | 预估: 计算中...", style="dim_text")  # 计算中 - 暗灰色
             
             footer_text.append("\n")
         else:
-            footer_text.append("📊 同步进度: ", style="bold cyan")
-            footer_text.append("等待数据...\n", style="dim")
+            footer_text.append("📊 同步进度: ", style="info")  # 标题 - 亮蓝色
+            footer_text.append("等待数据...\n", style="dim_text")  # 等待提示 - 暗灰色
         
         # 第二行：数据一致性统计
-        footer_text.append("🔍 数据一致性: ", style="bold")
-        footer_text.append(f"{consistent_count} 个表一致, ", style="green")
-        footer_text.append(f"{inconsistent_count} 个表不一致 ", style="red")
-        footer_text.append(f"(显示前 {min(len(tables), max_display)}/{len(tables)} 个表)\n", style="dim")
+        footer_text.append("🔍 数据一致性: ", style="dim_text")  # 标题 - 暗灰色
+        footer_text.append(f"{consistent_count} 个表一致, ", style="consistent")  # 一致状态 - 绿色粗体
+        footer_text.append(f"{inconsistent_count} 个表不一致 ", style="inconsistent")  # 不一致 - 红色粗体
+        footer_text.append(f"(显示前 {min(len(tables), max_display)}/{len(tables)} 个表)", style="normal")  # 统计信息 - 黑色
         
-        # 第三行：图例和操作提示
-        footer_text.append("📋 图例: ✅数据一致 ⚠️数据不一致 ❌查询错误 | ~估计值\n", style="dim")
-        footer_text.append("🔄 MySQL状态: ", style="dim")
-        footer_text.append("[green]绿色=已更新[/green] [yellow]黄色=更新中[/yellow] [red]红色=未更新[/red] | ",
-                           style="dim")
-        footer_text.append("💡 按 Ctrl+C 停止监控", style="yellow")
+        # 第三行：操作提示
+        footer_text.append("💡 按 Ctrl+C 停止监控", style="warning")  # 操作提示 - 黄色粗体
 
-        return Panel(footer_text, box=box.ROUNDED, style="dim")
+        return Panel(footer_text, box=box.ROUNDED, style="footer_border")
 
     def create_layout(self, tables: List[TableInfo]) -> Layout:
         """创建布局"""
@@ -894,9 +933,9 @@ class PostgreSQLMonitor:
 
         layout.split_column(
             Layout(self.create_header_panel(), size=3),
-            Layout(self.create_combined_stats_panel(tables), size=6),
+            Layout(self.create_combined_stats_panel(tables), size=4),
             Layout(self.create_tables_table(tables), name="tables"),
-            Layout(self.create_footer_panel(tables), size=6)
+            Layout(self.create_footer_panel(tables), size=4)
         )
 
         return layout
@@ -1106,18 +1145,18 @@ class PostgreSQLMonitor:
         max_display = self.monitor_config['max_tables_display']
         display_tables = sorted_tables[:max_display]
 
-        table = Table(box=box.ROUNDED, show_header=True, header_style="bold magenta")
-        table.add_column("序号", justify="right", style="dim", width=4)
+        table = Table(box=box.ROUNDED, show_header=True, header_style="table_header")
+        table.add_column("序号", justify="right", style="dim_text", width=4)
         table.add_column("状态", justify="center", width=4)
-        table.add_column("SCHEMA", style="cyan", width=15)
-        table.add_column("目标表名", style="blue", width=18)
-        table.add_column("PG记录数", justify="right", style="white", width=12)
-        table.add_column("MySQL汇总数", justify="right", style="white", width=12)
-        table.add_column("数据差异", justify="right", width=10)
-        table.add_column("变化量", justify="center", width=12)
-        table.add_column("PG更新时间", justify="center", style="dim", width=10)
-        table.add_column("MySQL状态", justify="center", style="dim", width=12)
-        table.add_column("源表数量", style="dim", width=8)
+        table.add_column("SCHEMA", style="schema_name", width=15)  # Schema名 - 洋红色
+        table.add_column("目标表名", style="table_name", width=18)  # 表名 - 蓝色
+        table.add_column("PG记录数", justify="right", style="normal", width=12)  # 数据计数 - 黑色
+        table.add_column("MySQL汇总数", justify="right", style="normal", width=12)  # 数据计数 - 黑色
+        table.add_column("数据差异", justify="right", width=10)  # 差异 - 根据状态动态着色
+        table.add_column("变化量", justify="center", width=12)  # 变化 - 根据状态动态着色
+        table.add_column("PG更新时间", justify="center", style="dim_text", width=10)  # 时间戳 - 暗灰色
+        table.add_column("MySQL状态", justify="center", style="dim_text", width=12)  # 状态 - 暗灰色
+        table.add_column("源表数量", style="dim_text", width=8)  # 次要信息 - 暗灰色
 
         for i, t in enumerate(display_tables, 1):
 
@@ -1136,52 +1175,53 @@ class PostgreSQLMonitor:
 
             # 数据差异样式 - 处理错误状态
             if t.pg_rows == -1 or t.mysql_rows == -1:
-                diff_style = "red"
+                diff_style = "error"
                 diff_text = "ERROR"
             else:
-                diff_style = "red" if t.data_diff < 0 else "green" if t.data_diff > 0 else "white"
+                # 负数(PG少了)=红色警告, 正数(PG多了)=黄色提醒, 0=正常
+                diff_style = "inconsistent" if t.data_diff < 0 else "warning" if t.data_diff > 0 else "unchanged"
                 diff_text = f"{t.data_diff:+,}" if t.data_diff != 0 else "0"
 
             # 变化量样式 - 处理错误状态
             if t.pg_rows == -1:
                 change_text = "ERROR"
-                change_style = "red"
+                change_style = "error"
             elif t.change > 0:
                 change_text = f"+{t.change:,} ⬆"
-                change_style = "green"
+                change_style = "consistent"
             elif t.change < 0:
                 change_text = f"{t.change:,} ⬇"
-                change_style = "red"
+                change_style = "inconsistent"
             else:
                 change_text = "0 ─"
-                change_style = "white"
+                change_style = "unchanged"
 
             # MySQL源表数量显示
             source_count = len(t.mysql_source_tables)
             source_display = str(source_count)
 
-            # MySQL状态显示
+            # MySQL状态显示 - 与PG更新时间列颜色逻辑保持一致
             if t.mysql_updating:
-                mysql_status = "[yellow]更新中[/yellow]"
+                mysql_status = "[updating]更新中[/updating]"  # 更新中 - 黄色粗体
             else:
                 mysql_relative_time = self.get_relative_time(t.mysql_last_updated)
                 if "年前" in mysql_relative_time or "个月前" in mysql_relative_time:
-                    mysql_status = "[red]未更新[/red]"
+                    mysql_status = "[error]未更新[/error]"  # 未更新 - 红色粗体
                 else:
-                    mysql_status = f"[green]{mysql_relative_time}[/green]"
+                    mysql_status = f"[dim_text]{mysql_relative_time}[/dim_text]"  # 已更新 - 与PG时间列一致的暗灰色
 
-            # 处理记录数显示
+            # 处理记录数显示 - 估计值用暗色标识
             if t.pg_rows == -1:
                 pg_rows_display = "ERROR"
             elif t.pg_is_estimated:
-                pg_rows_display = f"~{t.pg_rows:,}"
+                pg_rows_display = f"~{t.pg_rows:,}"  # ~符号表示估计值
             else:
                 pg_rows_display = f"{t.pg_rows:,}"
                 
             if t.mysql_rows == -1:
                 mysql_rows_display = "ERROR"
             elif t.mysql_is_estimated:
-                mysql_rows_display = f"~{t.mysql_rows:,}"
+                mysql_rows_display = f"~{t.mysql_rows:,}"  # ~符号表示估计值
             else:
                 mysql_rows_display = f"{t.mysql_rows:,}"
             
@@ -1190,8 +1230,8 @@ class PostgreSQLMonitor:
                 icon,
                 schema_name,
                 table_name,
-                f"[red]{pg_rows_display}[/red]" if t.pg_rows == -1 else pg_rows_display,
-                f"[red]{mysql_rows_display}[/red]" if t.mysql_rows == -1 else mysql_rows_display,
+                f"[error]{pg_rows_display}[/error]" if t.pg_rows == -1 else pg_rows_display,
+                f"[error]{mysql_rows_display}[/error]" if t.mysql_rows == -1 else mysql_rows_display,
                 f"[{diff_style}]{diff_text}[/{diff_style}]",
                 f"[{change_style}]{change_text}[/{change_style}]",
                 self.get_relative_time(t.last_updated),
