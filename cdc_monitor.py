@@ -207,6 +207,9 @@ class PostgreSQLMonitor:
         self.first_mysql_update = True  # 标记是否是第一次MySQL更新
         self.first_pg_update = True  # 标记是否是第一次PostgreSQL更新
         
+        # 停止标志，用于优雅退出
+        self.stop_event = threading.Event()
+        
         # 异步MySQL更新支持
         self.mysql_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="mysql-worker")
         self.mysql_update_lock = threading.Lock()
@@ -245,11 +248,23 @@ class PostgreSQLMonitor:
             return f"{years}年前"
 
     def _signal_handler(self, signum, frame):
-        """信号处理器"""
+        """信号处理器 - 快速响应，不等待长时间任务"""
         self.console.print("\n[yellow]正在停止监控程序...[/yellow]")
-        # 关闭线程池
+        
+        # 设置停止标志
+        self.stop_event.set()
+        
+        # 立即关闭线程池，不等待正在执行的任务完成
         if hasattr(self, 'mysql_executor'):
-            self.mysql_executor.shutdown(wait=True)
+            self.console.print("[dim]强制关闭MySQL查询线程...[/dim]")
+            # 使用shutdown(wait=False)立即关闭，不等待正在执行的任务
+            self.mysql_executor.shutdown(wait=False)
+            
+            # 可选：尝试取消正在进行的任务
+            for future in self.mysql_update_futures:
+                if not future.done():
+                    future.cancel()
+        
         self.console.print("[yellow]监控程序已停止[/yellow]")
         sys.exit(0)
 
@@ -330,7 +345,7 @@ class PostgreSQLMonitor:
             return None
 
     def connect_mysql(self, database: str) -> Optional[pymysql.Connection]:
-        """连接MySQL"""
+        """连接MySQL - 使用更短的超时时间"""
         try:
             conn = pymysql.connect(
                 host=self.mysql_config.host,
@@ -338,9 +353,9 @@ class PostgreSQLMonitor:
                 database=database,
                 user=self.mysql_config.username,
                 password=self.mysql_config.password,
-                connect_timeout=10,
-                read_timeout=30,  # 读取超时30秒
-                write_timeout=30,  # 写入超时30秒
+                connect_timeout=5,    # 减少连接超时时间：10秒 -> 5秒
+                read_timeout=15,      # 减少读取超时时间：30秒 -> 15秒  
+                write_timeout=15,     # 减少写入超时时间：30秒 -> 15秒
                 charset='utf8mb4'
             )
             return conn
@@ -460,8 +475,12 @@ class PostgreSQLMonitor:
                 mysql_conn.close()
 
     def _update_single_schema_mysql(self, schema_name: str, tables_dict: Dict[str, TableInfo], use_information_schema: bool = False) -> bool:
-        """更新单个schema的MySQL记录数（线程安全）"""
+        """更新单个schema的MySQL记录数（线程安全，支持中断）"""
         current_time = datetime.now()
+        
+        # 检查是否收到停止信号
+        if self.stop_event.is_set():
+            return False
         
         try:
             mysql_conn = self.connect_mysql(schema_name)
@@ -470,6 +489,10 @@ class PostgreSQLMonitor:
 
             try:
                 if use_information_schema:
+                    # 检查停止标志
+                    if self.stop_event.is_set():
+                        return False
+                        
                     # 第一次运行使用information_schema快速获取估计值
                     with mysql_conn.cursor() as cursor:
                         cursor.execute("""
@@ -488,6 +511,10 @@ class PostgreSQLMonitor:
 
                     # 更新TableInfo中的MySQL行数
                     for table_info in tables_dict.values():
+                        # 检查停止标志
+                        if self.stop_event.is_set():
+                            return False
+                            
                         with self.mysql_update_lock:
                             if table_info.mysql_updating:
                                 continue  # 如果正在更新中，跳过
@@ -506,6 +533,10 @@ class PostgreSQLMonitor:
                 else:
                     # 常规更新使用精确的COUNT查询
                     for table_info in tables_dict.values():
+                        # 检查停止标志
+                        if self.stop_event.is_set():
+                            return False
+                            
                         with self.mysql_update_lock:
                             if table_info.mysql_updating:
                                 continue  # 如果正在更新中，跳过
@@ -516,6 +547,12 @@ class PostgreSQLMonitor:
                         
                         # 更新所有源表的记录数
                         for mysql_table_name in table_info.mysql_source_tables:
+                            # 检查停止标志
+                            if self.stop_event.is_set():
+                                with self.mysql_update_lock:
+                                    table_info.mysql_updating = False
+                                return False
+                                
                             try:
                                 with mysql_conn.cursor() as cursor:
                                     # 先尝试使用主键索引进行count查询
@@ -972,45 +1009,61 @@ class PostgreSQLMonitor:
         time.sleep(3)
 
         # 主监控循环
-        with Live(console=self.console, refresh_per_second=1, screen=True) as live:
-            while True:
+        try:
+            with Live(console=self.console, refresh_per_second=1, screen=True) as live:
+                while not self.stop_event.is_set():
+                    try:
+                        self.iteration += 1
+
+                        # 1. 更新PostgreSQL记录数（每次都更新）
+                        self.pg_iteration += 1
+                        pg_conn = self.connect_postgresql()
+                        if pg_conn:
+                            # 后续都使用精确的COUNT查询（首次已经在初始化时完成）
+                            self.update_postgresql_counts(pg_conn, target_tables)
+                            pg_conn.close()
+
+                        # 2. 按间隔更新MySQL记录数（异步，不阻塞PostgreSQL查询）
+                        if self.pg_iteration % self.mysql_update_interval == 0:
+                            self.mysql_iteration += 1
+                            # 使用异步更新，不阻塞主循环
+                            self.update_mysql_counts_async(target_tables, use_information_schema=False)
+
+                        # 3. 将结果转换为列表格式用于显示
+                        self.tables = []
+                        for schema_name, tables_dict in target_tables.items():
+                            for table_info in tables_dict.values():
+                                self.tables.append(table_info)
+
+                        # 4. 更新显示
+                        live.update(self.create_layout(self.tables))
+
+                        # 等待下次刷新（可被中断）
+                        for _ in range(self.monitor_config['refresh_interval']):
+                            if self.stop_event.is_set():
+                                break
+                            time.sleep(1)
+
+                    except KeyboardInterrupt:
+                        # 在循环中捕获KeyboardInterrupt，确保能够退出
+                        break
+                    except Exception as e:
+                        if not self.stop_event.is_set():
+                            self.console.print(f"[red]监控过程中出错: {e}[/red]")
+                            time.sleep(5)
+                
+        finally:
+            # 确保线程池被关闭
+            self.console.print("[dim]正在清理资源...[/dim]")
+            if hasattr(self, 'mysql_executor'):
+                # 再次尝试关闭线程池，这次等待最多2秒
                 try:
-                    self.iteration += 1
-
-                    # 1. 更新PostgreSQL记录数（每次都更新）
-                    self.pg_iteration += 1
-                    pg_conn = self.connect_postgresql()
-                    if pg_conn:
-                        # 后续都使用精确的COUNT查询（首次已经在初始化时完成）
-                        self.update_postgresql_counts(pg_conn, target_tables)
-                        pg_conn.close()
-
-                    # 2. 按间隔更新MySQL记录数（异步，不阻塞PostgreSQL查询）
-                    if self.pg_iteration % self.mysql_update_interval == 0:
-                        self.mysql_iteration += 1
-                        # 使用异步更新，不阻塞主循环
-                        self.update_mysql_counts_async(target_tables, use_information_schema=False)
-
-                    # 3. 将结果转换为列表格式用于显示
-                    self.tables = []
-                    for schema_name, tables_dict in target_tables.items():
-                        for table_info in tables_dict.values():
-                            self.tables.append(table_info)
-
-                    # 4. 更新显示
-                    live.update(self.create_layout(self.tables))
-
-                    # 等待下次刷新
-                    time.sleep(self.monitor_config['refresh_interval'])
-
-                except KeyboardInterrupt:
-                    break
-                except Exception as e:
-                    self.console.print(f"[red]监控过程中出错: {e}[/red]")
-                    time.sleep(5)
-            
-            # 关闭线程池
-            self.mysql_executor.shutdown(wait=True)
+                    self.mysql_executor.shutdown(wait=False)
+                    # 给线程池2秒时间优雅关闭
+                    time.sleep(2)
+                except:
+                    pass
+            self.console.print("[green]资源清理完成[/green]")
 
 
 def main():

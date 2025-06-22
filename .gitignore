@@ -244,3 +244,4 @@ cython_debug/
 .idea/
 .venv/
 config.ini
+test_progress.py
