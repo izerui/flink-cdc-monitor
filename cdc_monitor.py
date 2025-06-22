@@ -61,6 +61,7 @@ class TableInfo:
     mysql_last_updated: datetime = field(default_factory=datetime.now)  # MySQL数据最后更新时间
     is_first_query: bool = True
     mysql_updating: bool = False  # MySQL是否正在更新中
+    pg_updating: bool = False  # PostgreSQL是否正在更新中
     pg_is_estimated: bool = False  # PG数据是否为估计值
     mysql_is_estimated: bool = False  # MySQL数据是否为估计值
 
@@ -244,6 +245,10 @@ class PostgreSQLMonitor:
         # 异步MySQL更新支持
         self.mysql_update_lock = asyncio.Lock()
         self.mysql_update_tasks = []  # 跟踪正在进行的MySQL更新任务
+        
+        # 异步PostgreSQL更新支持
+        self.pg_update_lock = asyncio.Lock()
+        self.pg_update_tasks = []  # 跟踪正在进行的PostgreSQL更新任务
 
         # 进度跟踪 - 用于计算同步速度和预估时间
         self.history_data = []  # 存储历史数据: [(时间戳, pg_total, mysql_total, pg_change)]
@@ -694,8 +699,100 @@ class PostgreSQLMonitor:
         finally:
             self.pg_updating = False
 
+    async def _update_single_schema_postgresql(self, schema_name: str, tables_dict: Dict[str, TableInfo]) -> bool:
+        """更新单个schema的PostgreSQL记录数（异步版本，支持中断）"""
+        current_time = datetime.now()
+        
+        # 检查是否收到停止信号
+        if self.stop_event.is_set():
+            return False
+            
+        try:
+            conn = await self.connect_postgresql()
+            if not conn:
+                return False
+
+            try:
+                # 常规更新使用精确的COUNT查询
+                for target_table_name, table_info in tables_dict.items():
+                    # 检查停止标志
+                    if self.stop_event.is_set():
+                        return False
+
+                    async with self.pg_update_lock:
+                        if table_info.pg_updating:
+                            continue  # 如果正在更新中，跳过
+                        table_info.pg_updating = True
+
+                    # 在锁外执行查询以避免长时间锁定
+                    try:
+                        # 直接获取记录数
+                        new_count = await conn.fetchval(f'SELECT COUNT(*) FROM "{schema_name}"."{target_table_name}"')
+
+                        # 查询完成后更新结果
+                        async with self.pg_update_lock:
+                            if not table_info.is_first_query:
+                                table_info.previous_pg_rows = table_info.pg_rows
+                            else:
+                                table_info.previous_pg_rows = new_count
+                                table_info.is_first_query = False
+
+                            table_info.pg_rows = new_count
+                            table_info.last_updated = current_time
+                            table_info.pg_updating = False
+                            table_info.pg_is_estimated = False  # 标记为精确值
+
+                    except Exception as e:
+                        # 出现异常时标记为错误状态
+                        async with self.pg_update_lock:
+                            if not table_info.is_first_query:
+                                table_info.previous_pg_rows = table_info.pg_rows
+                            else:
+                                table_info.previous_pg_rows = -1
+                                table_info.is_first_query = False
+
+                            table_info.pg_rows = -1  # -1表示查询失败
+                            table_info.last_updated = current_time
+                            table_info.pg_updating = False
+                            table_info.pg_is_estimated = False  # 错误状态不是估计值
+
+                return True
+            finally:
+                await conn.close()
+
+        except Exception as e:
+            # 出现异常时，标记所有表的pg_updating为False
+            async with self.pg_update_lock:
+                for table_info in tables_dict.values():
+                    if table_info.pg_updating:
+                        table_info.pg_updating = False
+            return False
+
+    async def update_postgresql_counts_async(self, target_tables: Dict[str, Dict[str, TableInfo]]):
+        """异步更新PostgreSQL记录数（不阻塞主线程）"""
+        # 清理已完成的任务
+        self.pg_update_tasks = [f for f in self.pg_update_tasks if not f.done()]
+        
+        # 检查是否已经有正在进行的更新任务
+        if self.pg_updating:
+            return
+            
+        # 为每个schema提交异步更新任务
+        for schema_name, tables_dict in target_tables.items():
+            # 检查该schema是否已经有正在进行的更新任务
+            schema_updating = False
+            async with self.pg_update_lock:
+                for table_info in tables_dict.values():
+                    if table_info.pg_updating:
+                        schema_updating = True
+                        break
+            
+            if not schema_updating:
+                future = asyncio.create_task(self._update_single_schema_postgresql(schema_name, tables_dict))
+                self.pg_update_tasks.append(future)
+
     async def update_postgresql_counts(self, conn, target_tables: Dict[str, Dict[str, TableInfo]]):
-        """更新PostgreSQL记录数（常规精确查询）"""
+        """更新PostgreSQL记录数（同步版本，用于兼容性）"""
         current_time = datetime.now()
         self.pg_updating = True
         try:
@@ -807,15 +904,18 @@ class PostgreSQLMonitor:
 
         # 显示更新状态
         mysql_updating_count = sum(1 for t in tables if t.mysql_updating)
-        active_futures = len([f for f in self.mysql_update_tasks if not f.done()])
+        active_mysql_futures = len([f for f in self.mysql_update_tasks if not f.done()])
+        
+        pg_updating_count = sum(1 for t in tables if t.pg_updating)
+        active_pg_futures = len([f for f in self.pg_update_tasks if not f.done()])
 
         # PostgreSQL更新状态
-        if self.pg_updating:
-            stats_text.append(f", PG更新中", style="updating")  # 更新中 - 黄色粗体
+        if pg_updating_count > 0 or active_pg_futures > 0:
+            stats_text.append(f", PG更新中: {pg_updating_count} 个表, {active_pg_futures} 个任务", style="updating")  # 更新中 - 黄色粗体
 
         # MySQL更新状态
-        if mysql_updating_count > 0 or active_futures > 0:
-            stats_text.append(f", MySQL更新中: {mysql_updating_count} 个表, {active_futures} 个任务",
+        if mysql_updating_count > 0 or active_mysql_futures > 0:
+            stats_text.append(f", MySQL更新中: {mysql_updating_count} 个表, {active_mysql_futures} 个任务",
                               style="updating")  # 更新中 - 黄色粗体
 
         # 显示详细的Schema统计
@@ -989,13 +1089,10 @@ class PostgreSQLMonitor:
                     try:
                         self.iteration += 1
 
-                        # 1. 更新PostgreSQL记录数（每次都更新）
+                        # 1. 更新PostgreSQL记录数（异步，不阻塞主循环）
                         self.pg_iteration += 1
-                        pg_conn = await self.connect_postgresql()
-                        if pg_conn:
-                            # 后续都使用精确的COUNT查询（首次已经在初始化时完成）
-                            await self.update_postgresql_counts(pg_conn, target_tables)
-                            await pg_conn.close()
+                        # 使用异步更新，不阻塞主循环
+                        await self.update_postgresql_counts_async(target_tables)
 
                         # 2. 按间隔更新MySQL记录数（异步，不阻塞PostgreSQL查询）
                         if self.pg_iteration % self.mysql_update_interval == 0:
