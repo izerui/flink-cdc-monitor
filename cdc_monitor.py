@@ -9,11 +9,13 @@ import time
 import signal
 import sys
 import re
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from configparser import ConfigParser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psycopg2
 import pymysql
@@ -202,6 +204,11 @@ class PostgreSQLMonitor:
         self.mysql_update_interval = 3  # MySQL更新间隔（相对于PostgreSQL）
         self.first_mysql_update = True  # 标记是否是第一次MySQL更新
         self.first_pg_update = True  # 标记是否是第一次PostgreSQL更新
+        
+        # 异步MySQL更新支持
+        self.mysql_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="mysql-worker")
+        self.mysql_update_lock = threading.Lock()
+        self.mysql_update_futures = []  # 跟踪正在进行的MySQL更新任务
 
         # 信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -237,7 +244,11 @@ class PostgreSQLMonitor:
 
     def _signal_handler(self, signum, frame):
         """信号处理器"""
-        self.console.print("\n[yellow]监控程序已停止[/yellow]")
+        self.console.print("\n[yellow]正在停止监控程序...[/yellow]")
+        # 关闭线程池
+        if hasattr(self, 'mysql_executor'):
+            self.mysql_executor.shutdown(wait=True)
+        self.console.print("[yellow]监控程序已停止[/yellow]")
         sys.exit(0)
 
     def load_config(self) -> bool:
@@ -317,6 +328,8 @@ class PostgreSQLMonitor:
                 user=self.mysql_config.username,
                 password=self.mysql_config.password,
                 connect_timeout=10,
+                read_timeout=30,  # 读取超时30秒
+                write_timeout=30,  # 写入超时30秒
                 charset='utf8mb4'
             )
             return conn
@@ -435,14 +448,14 @@ class PostgreSQLMonitor:
             finally:
                 mysql_conn.close()
 
-    def update_mysql_counts(self, target_tables: Dict[str, Dict[str, TableInfo]], use_information_schema: bool = False):
-        """更新MySQL记录数（独立更新）"""
+    def _update_single_schema_mysql(self, schema_name: str, tables_dict: Dict[str, TableInfo], use_information_schema: bool = False) -> bool:
+        """更新单个schema的MySQL记录数（线程安全）"""
         current_time = datetime.now()
-
-        for schema_name, tables_dict in target_tables.items():
+        
+        try:
             mysql_conn = self.connect_mysql(schema_name)
             if not mysql_conn:
-                continue
+                return False
 
             try:
                 if use_information_schema:
@@ -464,29 +477,32 @@ class PostgreSQLMonitor:
 
                     # 更新TableInfo中的MySQL行数
                     for table_info in tables_dict.values():
-                        if table_info.mysql_updating:
-                            continue  # 如果正在更新中，跳过
+                        with self.mysql_update_lock:
+                            if table_info.mysql_updating:
+                                continue  # 如果正在更新中，跳过
 
-                        table_info.mysql_updating = True
-                        table_info.mysql_rows = 0  # 重置
-                        
-                        # 累加所有源表的估计行数
-                        for mysql_table_name in table_info.mysql_source_tables:
-                            if mysql_table_name in table_rows_map:
-                                table_info.mysql_rows += table_rows_map[mysql_table_name]
-                        
-                        table_info.mysql_last_updated = current_time
-                        table_info.mysql_updating = False
-                        table_info.mysql_is_estimated = True  # 标记为估计值
+                            table_info.mysql_updating = True
+                            table_info.mysql_rows = 0  # 重置
+                            
+                            # 累加所有源表的估计行数
+                            for mysql_table_name in table_info.mysql_source_tables:
+                                if mysql_table_name in table_rows_map:
+                                    table_info.mysql_rows += table_rows_map[mysql_table_name]
+                            
+                            table_info.mysql_last_updated = current_time
+                            table_info.mysql_updating = False
+                            table_info.mysql_is_estimated = True  # 标记为估计值
                 else:
                     # 常规更新使用精确的COUNT查询
                     for table_info in tables_dict.values():
-                        if table_info.mysql_updating:
-                            continue  # 如果正在更新中，跳过
-
-                        table_info.mysql_updating = True
-                        table_info.mysql_rows = 0  # 重置
-
+                        with self.mysql_update_lock:
+                            if table_info.mysql_updating:
+                                continue  # 如果正在更新中，跳过
+                            table_info.mysql_updating = True
+                            
+                        # 在锁外执行查询以避免长时间锁定
+                        temp_mysql_rows = 0
+                        
                         # 更新所有源表的记录数
                         for mysql_table_name in table_info.mysql_source_tables:
                             try:
@@ -499,17 +515,53 @@ class PostgreSQLMonitor:
                                         # 如果使用索引失败（可能没有主键索引），使用普通查询
                                         cursor.execute(f"SELECT COUNT(*) FROM `{mysql_table_name}`")
                                         mysql_rows = cursor.fetchone()[0]
-                                table_info.mysql_rows += mysql_rows
+                                temp_mysql_rows += mysql_rows
                             except Exception as e:
                                 # 表可能不存在或无权限，跳过
                                 continue
+                        
+                        # 查询完成后更新结果
+                        with self.mysql_update_lock:
+                            table_info.mysql_rows = temp_mysql_rows
+                            table_info.mysql_last_updated = current_time
+                            table_info.mysql_updating = False
+                            table_info.mysql_is_estimated = False  # 标记为精确值
 
-                        table_info.mysql_last_updated = current_time
-                        table_info.mysql_updating = False
-                        table_info.mysql_is_estimated = False  # 标记为精确值
-
+                return True
             finally:
                 mysql_conn.close()
+                
+        except Exception as e:
+            # 出现异常时，标记所有表的mysql_updating为False
+            with self.mysql_update_lock:
+                for table_info in tables_dict.values():
+                    if table_info.mysql_updating:
+                        table_info.mysql_updating = False
+            return False
+
+    def update_mysql_counts_async(self, target_tables: Dict[str, Dict[str, TableInfo]], use_information_schema: bool = False):
+        """异步更新MySQL记录数（不阻塞主线程）"""
+        # 清理已完成的任务
+        self.mysql_update_futures = [f for f in self.mysql_update_futures if not f.done()]
+        
+        # 为每个schema提交异步更新任务
+        for schema_name, tables_dict in target_tables.items():
+            # 检查该schema是否已经有正在进行的更新任务
+            schema_updating = False
+            with self.mysql_update_lock:
+                for table_info in tables_dict.values():
+                    if table_info.mysql_updating:
+                        schema_updating = True
+                        break
+            
+            if not schema_updating:
+                future = self.mysql_executor.submit(self._update_single_schema_mysql, schema_name, tables_dict, use_information_schema)
+                self.mysql_update_futures.append(future)
+
+    def update_mysql_counts(self, target_tables: Dict[str, Dict[str, TableInfo]], use_information_schema: bool = False):
+        """更新MySQL记录数（同步版本，用于兼容性）"""
+        for schema_name, tables_dict in target_tables.items():
+            self._update_single_schema_mysql(schema_name, tables_dict, use_information_schema)
 
     def get_postgresql_rows_from_pg_stat(self, conn, target_tables: Dict[str, Dict[str, TableInfo]]):
         """第一次运行时使用pg_stat_user_tables快速获取PostgreSQL表行数估计值"""
@@ -680,6 +732,12 @@ class PostgreSQLMonitor:
             stats_text.append(f", {inconsistent_count} 个不一致", style="red")
         if len(error_tables) > 0:
             stats_text.append(f", {len(error_tables)} 个错误", style="red")
+        
+        # 显示MySQL异步任务状态
+        mysql_updating_count = sum(1 for t in tables if t.mysql_updating)
+        active_futures = len([f for f in self.mysql_update_futures if not f.done()])
+        if mysql_updating_count > 0 or active_futures > 0:
+            stats_text.append(f", MySQL更新中: {mysql_updating_count} 个表, {active_futures} 个任务", style="yellow")
         
         # 如果有多个Schema，显示详细的Schema统计
         if len(schema_stats) > 1:
@@ -866,7 +924,7 @@ class PostgreSQLMonitor:
 
         self.console.print(f"[green]配置的MySQL数据库: {', '.join(self.mysql_config.databases)}[/green]")
         self.console.print(f"[green]开始监控，PG刷新间隔: {self.monitor_config['refresh_interval']} 秒[/green]")
-        self.console.print(f"[green]MySQL更新间隔: {self.mysql_update_interval} 次PG更新[/green]")
+        self.console.print(f"[green]MySQL更新间隔: {self.mysql_update_interval} 次PG更新 (异步执行，不阻塞PG查询)[/green]")
 
         # 初始化表结构 - 显示进度提示
         self.console.print("[yellow]正在初始化表结构，请稍候...[/yellow]")
@@ -916,12 +974,11 @@ class PostgreSQLMonitor:
                         self.update_postgresql_counts(pg_conn, target_tables)
                         pg_conn.close()
 
-                    # 2. 按间隔更新MySQL记录数（较慢的操作）
+                    # 2. 按间隔更新MySQL记录数（异步，不阻塞PostgreSQL查询）
                     if self.pg_iteration % self.mysql_update_interval == 0:
                         self.mysql_iteration += 1
-                        # 后续都使用精确的COUNT查询
-                        self.console.print(f"[dim]MySQL数据已更新 (第{self.mysql_iteration}次)[/dim]", end="")
-                        self.update_mysql_counts(target_tables, use_information_schema=False)
+                        # 使用异步更新，不阻塞主循环
+                        self.update_mysql_counts_async(target_tables, use_information_schema=False)
 
                     # 3. 将结果转换为列表格式用于显示
                     self.tables = []
@@ -940,6 +997,9 @@ class PostgreSQLMonitor:
                 except Exception as e:
                     self.console.print(f"[red]监控过程中出错: {e}[/red]")
                     time.sleep(5)
+            
+            # 关闭线程池
+            self.mysql_executor.shutdown(wait=True)
 
 
 def main():
