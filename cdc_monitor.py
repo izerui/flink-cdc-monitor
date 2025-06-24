@@ -958,6 +958,7 @@ class PostgreSQLMonitor:
 
             # 计算完成百分比 - PostgreSQL追赶MySQL的进度
             if total_mysql_rows > 0:
+                # 修改计算逻辑，确保进度条准确反映同步进度
                 completion_rate = min(total_pg_rows / total_mysql_rows, 1.0)
             else:
                 completion_rate = 1.0 if total_pg_rows == 0 else 0.0
@@ -1168,12 +1169,16 @@ class PostgreSQLMonitor:
 
         return total_change / time_span if time_span > 0 else 0.0
 
-    def estimate_remaining_time(self, pg_total: int, mysql_total: int, speed: float) -> str:
+    def estimate_remaining_time(self, mysql_total: int, pg_total: int, speed: float) -> str:
         """估算剩余时间"""
-        if speed <= 0 or pg_total <= mysql_total:
+        if speed <= 0 or mysql_total <= 0:
             return "无法估算"
 
-        remaining_records = pg_total - mysql_total
+        # 计算还需要同步的记录数
+        remaining_records = mysql_total - pg_total
+        if remaining_records <= 0:
+            return "已完成"
+
         remaining_seconds = remaining_records / speed
 
         if remaining_seconds < 60:
