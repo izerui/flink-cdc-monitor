@@ -254,6 +254,12 @@ class PostgreSQLMonitor:
         self.history_data = []  # 存储历史数据: [(时间戳, pg_total, mysql_total, pg_change)]
         self.max_history_points = 20  # 保留最近20个数据点用于计算速度
 
+        # 分页相关属性
+        self.current_page = 1  # 当前页码
+        self.page_size = 20  # 每页显示的表数量
+        self.page_interval = 10  # 翻页间隔（秒）
+        self.last_page_change = datetime.now()  # 上次翻页时间
+
         # 信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -344,13 +350,18 @@ class PostgreSQLMonitor:
             monitor_section = config['monitor']
             self.monitor_config = {
                 'refresh_interval': int(monitor_section.get('refresh_interval', 3)),
-                'max_tables_display': int(monitor_section.get('max_tables_display', 50)),
                 'enable_clear_screen': monitor_section.getboolean('enable_clear_screen', True),
-                'mysql_update_interval': int(monitor_section.get('mysql_update_interval', 3))
+                'mysql_update_interval': int(monitor_section.get('mysql_update_interval', 3)),
+                'page_size': int(monitor_section.get('page_size', 20)),
+                'page_interval': int(monitor_section.get('page_interval', 10))
             }
 
             # 更新MySQL更新间隔
             self.mysql_update_interval = self.monitor_config['mysql_update_interval']
+            
+            # 更新分页配置
+            self.page_size = self.monitor_config['page_size']
+            self.page_interval = self.monitor_config['page_interval']
 
             return True
 
@@ -944,7 +955,6 @@ class PostgreSQLMonitor:
         """创建底部面板"""
         consistent_count = len([t for t in tables if t.is_consistent])
         inconsistent_count = len(tables) - consistent_count
-        max_display = self.monitor_config['max_tables_display']
 
         footer_text = Text()
 
@@ -1016,10 +1026,15 @@ class PostgreSQLMonitor:
         footer_text.append("🔍 数据一致性: ", style="dim_text")  # 标题 - 暗灰色
         footer_text.append(f"{consistent_count} 个表一致, ", style="consistent")  # 一致状态 - 绿色粗体
         footer_text.append(f"{inconsistent_count} 个表不一致 ", style="inconsistent")  # 不一致 - 红色粗体
-        footer_text.append(f"(显示前 {min(len(tables), max_display)}/{len(tables)} 个表)", style="normal")  # 统计信息 - 黑色
+        
+        # 计算总页数
+        total_pages = (len(tables) + self.page_size - 1) // self.page_size
+        start_idx = (self.current_page - 1) * self.page_size
+        end_idx = min(start_idx + self.page_size, len(tables))
+        footer_text.append(f"(显示第{start_idx + 1}-{end_idx}/{len(tables)}条记录)", style="normal")  # 统计信息 - 黑色
 
         # 第三行：操作提示
-        footer_text.append("💡 按 Ctrl+C 停止监控", style="warning")  # 操作提示 - 黄色粗体
+        footer_text.append("\n💡 按 Ctrl+C 停止监控", style="warning")  # 操作提示 - 黄色粗体
 
         return Panel(footer_text, box=box.ROUNDED, style="footer_border")
 
@@ -1230,8 +1245,20 @@ class PostgreSQLMonitor:
                 return (2, -t.pg_rows)  # 数据一致且无变化，按记录数排序
 
         sorted_tables = sorted(tables, key=sort_key)
-        max_display = self.monitor_config['max_tables_display']
-        display_tables = sorted_tables[:max_display]
+        
+        # 计算总页数
+        total_pages = (len(sorted_tables) + self.page_size - 1) // self.page_size
+        
+        # 检查是否需要翻页
+        now = datetime.now()
+        if (now - self.last_page_change).total_seconds() >= self.page_interval:
+            self.current_page = (self.current_page % total_pages) + 1
+            self.last_page_change = now
+        
+        # 计算当前页的表格范围
+        start_idx = (self.current_page - 1) * self.page_size
+        end_idx = start_idx + self.page_size
+        display_tables = sorted_tables[start_idx:end_idx]
 
         table = Table(box=box.ROUNDED, show_header=True, header_style="table_header")
         table.add_column("序号", justify="right", style="dim_text", width=4)
@@ -1246,7 +1273,11 @@ class PostgreSQLMonitor:
         table.add_column("MySQL状态", justify="center", style="dim_text", width=12)  # 状态 - 暗灰色
         table.add_column("源表数量", style="dim_text", width=8)  # 次要信息 - 暗灰色
 
-        for i, t in enumerate(display_tables, 1):
+        # 添加分页信息到表格标题
+        table.title = f"表格列表 (第{self.current_page}/{total_pages}页, 每页{self.page_size}条, {self.page_interval}秒自动翻页)"
+        table.title_style = "bright_blue"
+
+        for i, t in enumerate(display_tables, start_idx + 1):
 
             # 图标选择 - 包含错误状态
             if t.pg_rows == -1 or t.mysql_rows == -1:
