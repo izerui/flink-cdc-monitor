@@ -1231,8 +1231,8 @@ class PostgreSQLMonitor:
         table = Table(box=box.ROUNDED, show_header=True, header_style="table_header")
         table.add_column("序号", justify="right", style="dim_text", width=4)
         table.add_column("状态", justify="center", width=4)
-        table.add_column("SCHEMA", style="schema_name", width=15)  # Schema名 - 洋红色
-        table.add_column("目标表名", style="table_name", width=18)  # 表名 - 蓝色
+        table.add_column("SCHEMA", style="schema_name", width=8)  # Schema名 - 洋红色
+        table.add_column("目标表名", style="table_name", width=40)  # 表名 - 蓝色
         table.add_column("PG记录数", justify="right", style="normal", width=12)  # 数据计数 - 黑色
         table.add_column("MySQL汇总数", justify="right", style="normal", width=12)  # 数据计数 - 黑色
         table.add_column("数据差异", justify="right", width=10)  # 差异 - 根据状态动态着色
@@ -1254,7 +1254,7 @@ class PostgreSQLMonitor:
             # 截断长名称
             schema_name = t.schema_name[:13] + "..." if len(t.schema_name) > 15 else t.schema_name
             # 现在图标单独一列，表名可以显示更多字符
-            table_name = t.target_table_name[:15] + "..." if len(t.target_table_name) > 18 else t.target_table_name
+            table_name = t.target_table_name
 
             # 数据差异样式 - 处理错误状态
             if t.pg_rows == -1 or t.mysql_rows == -1:

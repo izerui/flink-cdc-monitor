@@ -4,3 +4,4 @@ globs:
 alwaysApply: false
 ---
 用的uv运行python脚本。
+使用 source .venv/bin/activate  来运行测试脚本
