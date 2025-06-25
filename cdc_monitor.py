@@ -260,7 +260,7 @@ class PostgreSQLMonitor:
         self.page_interval = 10  # 翻页间隔（秒）
         self.last_page_change = datetime.now()  # 上次翻页时间
         self.countdown_task = None  # 倒计时任务
-        self.remaining_seconds = self.page_interval  # 剩余秒数
+        self.remaining_seconds = 10  # 剩余秒数，初始化为默认值，加载配置后会更新
         self.countdown_event = asyncio.Event()  # 用于控制倒计时任务
 
         # 信号处理
@@ -365,6 +365,9 @@ class PostgreSQLMonitor:
             # 更新分页配置
             self.page_size = self.monitor_config['page_size']
             self.page_interval = self.monitor_config['page_interval']
+            
+            # 重新初始化剩余秒数，确保使用配置文件中的值
+            self.remaining_seconds = self.page_interval
 
             return True
 
