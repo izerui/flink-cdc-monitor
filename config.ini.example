@@ -15,12 +15,13 @@ password = postgres
 
 [monitor]
 # 刷新间隔，单位秒
-refresh_interval = 3
+refresh_interval = 2
 # 是否启用清屏
 enable_clear_screen = true
 # MySQL更新间隔，单位秒
-mysql_update_interval = 3
+mysql_update_interval = 5
 # 每页显示的记录数
-page_size = 20
+page_size = 50
 # 自动翻页间隔（秒）
-page_interval = 10
+page_interval = 20
+

@@ -259,6 +259,9 @@ class PostgreSQLMonitor:
         self.page_size = 20  # 每页显示的表数量
         self.page_interval = 10  # 翻页间隔（秒）
         self.last_page_change = datetime.now()  # 上次翻页时间
+        self.countdown_task = None  # 倒计时任务
+        self.remaining_seconds = self.page_interval  # 剩余秒数
+        self.countdown_event = asyncio.Event()  # 用于控制倒计时任务
 
         # 信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -1031,7 +1034,14 @@ class PostgreSQLMonitor:
         total_pages = (len(tables) + self.page_size - 1) // self.page_size
         start_idx = (self.current_page - 1) * self.page_size
         end_idx = min(start_idx + self.page_size, len(tables))
-        footer_text.append(f"(显示第{start_idx + 1}-{end_idx}/{len(tables)}条记录)", style="normal")  # 统计信息 - 黑色
+
+        # 添加翻页倒计时进度条
+        if total_pages > 1:  # 只有多于一页时才显示进度条
+            footer_text.append("\n")
+            countdown_progress = self.create_countdown_progress()
+            footer_text.append(countdown_progress)
+            footer_text.append(f" ({self.current_page}/{total_pages}页)", style="dim_text")
+            footer_text.append(f"(显示第{start_idx + 1}-{end_idx}/{len(tables)}条记录)", style="normal")  # 统计信息 - 黑色
 
         # 第三行：操作提示
         footer_text.append("\n💡 按 Ctrl+C 停止监控", style="warning")  # 操作提示 - 黄色粗体
@@ -1046,7 +1056,7 @@ class PostgreSQLMonitor:
             Layout(self.create_header_panel(), size=3),
             Layout(self.create_combined_stats_panel(tables), size=4),
             Layout(self.create_tables_table(tables), name="tables"),
-            Layout(self.create_footer_panel(tables), size=4)
+            Layout(self.create_footer_panel(tables), size=6)
         )
 
         return layout
@@ -1098,9 +1108,12 @@ class PostgreSQLMonitor:
         # 给用户3秒时间查看初始化信息
         await asyncio.sleep(3)
 
+        # 启动倒计时任务
+        self.countdown_task = asyncio.create_task(self.countdown_timer())
+
         # 主监控循环
         try:
-            with Live(console=self.console, refresh_per_second=1, screen=True) as live:
+            with Live(console=self.console, refresh_per_second=2) as live:  # 提高刷新率到每秒2次
                 while not self.stop_event.is_set():
                     try:
                         self.iteration += 1
@@ -1129,10 +1142,7 @@ class PostgreSQLMonitor:
                         live.update(self.create_layout(self.tables))
 
                         # 等待下次刷新（可被中断）
-                        for _ in range(self.monitor_config['refresh_interval']):
-                            if self.stop_event.is_set():
-                                break
-                            await asyncio.sleep(1)
+                        await asyncio.sleep(self.monitor_config['refresh_interval'])
 
                     except KeyboardInterrupt:
                         # 在循环中捕获KeyboardInterrupt，确保能够退出
@@ -1143,6 +1153,13 @@ class PostgreSQLMonitor:
                             await asyncio.sleep(5)
 
         finally:
+            # 停止倒计时任务
+            if self.countdown_task:
+                self.countdown_task.cancel()
+                try:
+                    await self.countdown_task
+                except asyncio.CancelledError:
+                    pass
             self.console.print("[green]资源清理完成[/green]")
 
     def update_progress_data(self, tables: List[TableInfo]):
@@ -1231,29 +1248,8 @@ class PostgreSQLMonitor:
     def create_tables_table(self, tables: List[TableInfo]) -> Table:
         """创建表格"""
 
-        # 智能排序：数据不一致的表优先显示，一致的表排在后面
-        def sort_key(t: TableInfo):
-            # 排序优先级：
-            # 1. 数据不一致的表（最高优先级）- 按数据差异绝对值降序
-            # 2. 数据一致但有变化的表 - 按变化量绝对值降序  
-            # 3. 数据一致且无变化的表 - 按PostgreSQL记录数降序
-            if not t.is_consistent:
-                return (0, -abs(t.data_diff), -t.pg_rows)  # 数据不一致，按差异绝对值和记录数排序
-            elif t.change != 0:
-                return (1, -abs(t.change), -t.pg_rows)  # 数据一致但有变化，按变化量和记录数排序
-            else:
-                return (2, -t.pg_rows)  # 数据一致且无变化，按记录数排序
-
-        sorted_tables = sorted(tables, key=sort_key)
-        
-        # 计算总页数
-        total_pages = (len(sorted_tables) + self.page_size - 1) // self.page_size
-        
-        # 检查是否需要翻页
-        now = datetime.now()
-        if (now - self.last_page_change).total_seconds() >= self.page_interval:
-            self.current_page = (self.current_page % total_pages) + 1
-            self.last_page_change = now
+        # 按schema名和表名排序
+        sorted_tables = sorted(tables, key=lambda t: (t.schema_name, t.target_table_name))
         
         # 计算当前页的表格范围
         start_idx = (self.current_page - 1) * self.page_size
@@ -1272,10 +1268,6 @@ class PostgreSQLMonitor:
         table.add_column("PG更新时间", justify="center", style="dim_text", width=10)  # 时间戳 - 暗灰色
         table.add_column("MySQL状态", justify="center", style="dim_text", width=12)  # 状态 - 暗灰色
         table.add_column("源表数量", style="dim_text", width=8)  # 次要信息 - 暗灰色
-
-        # 添加分页信息到表格标题
-        table.title = f"表格列表 (第{self.current_page}/{total_pages}页, 每页{self.page_size}条, {self.page_interval}秒自动翻页)"
-        table.title_style = "bright_blue"
 
         for i, t in enumerate(display_tables, start_idx + 1):
 
@@ -1359,6 +1351,58 @@ class PostgreSQLMonitor:
             )
 
         return table
+
+    async def countdown_timer(self):
+        """倒计时更新任务"""
+        while not self.stop_event.is_set():
+            try:
+                # 重置倒计时
+                self.remaining_seconds = self.page_interval
+                
+                # 每秒更新倒计时
+                while self.remaining_seconds > 0 and not self.stop_event.is_set():
+                    await asyncio.sleep(1)
+                    self.remaining_seconds -= 1
+                    
+                # 如果不是因为停止信号而结束，则触发翻页
+                if not self.stop_event.is_set():
+                    # 计算总页数
+                    total_pages = (len(self.tables) + self.page_size - 1) // self.page_size if self.tables else 1
+                    # 更新页码，确保不超过总页数
+                    self.current_page = (self.current_page % total_pages) + 1
+                    self.last_page_change = datetime.now()
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    self.console.print(f"[red]倒计时更新出错: {e}[/red]")
+                    await asyncio.sleep(1)
+
+    def create_countdown_progress(self) -> Text:
+        """创建倒计时进度条"""
+        progress_text = Text()
+        
+        # 计算进度
+        progress_ratio = self.remaining_seconds / self.page_interval
+        
+        # 进度条参数
+        bar_width = 20  # 进度条宽度
+        filled_width = int(bar_width * progress_ratio)
+        empty_width = bar_width - filled_width
+        
+        # 根据剩余时间设置颜色
+        if progress_ratio > 0.6:
+            bar_color = "info"  # 剩余时间充足 - 蓝色
+        elif progress_ratio > 0.3:
+            bar_color = "warning"  # 剩余时间中等 - 黄色
+        else:
+            bar_color = "error"  # 剩余时间不多 - 红色
+        
+        # 绘制进度条
+        progress_text.append("📄 翻页进度: ", style="dim_text")
+        progress_text.append("█" * filled_width, style=bar_color)  # 已过时间
+        progress_text.append("░" * empty_width, style="dim_text")  # 剩余时间
+        progress_text.append(f" {int(self.remaining_seconds)}秒后翻页", style=bar_color)
+        
+        return progress_text
 
 
 def main():
