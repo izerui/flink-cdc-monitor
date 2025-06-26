@@ -3,5 +3,6 @@ description:
 globs: 
 alwaysApply: false
 ---
-用的uv运行python脚本。
-使用 source .venv/bin/activate  来运行测试脚本
+每次回答完用户的问题并总结后,询问用户是否需要从问题和总结内容中提炼提炼出约束、指引、规范、风格相关的内容,并将生成的提示词信息增加到`.cursor/rules/rules.mdc`文件后面.
+1. 用的uv运行python脚本。
+2. 使用 source .venv/bin/activate  来运行测试脚本
