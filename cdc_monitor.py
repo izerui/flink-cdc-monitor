@@ -269,13 +269,30 @@ class StatsWidget(Static):
         
         text.append("\n")
         
-        # 进度信息和同步速度
+        # 进度信息和同步速度 - 带进度条
         if total_mysql_rows > 0:
             completion_rate = min(total_pg_rows / total_mysql_rows, 1.0)
             completion_percent = completion_rate * 100
             
             text.append("📊 同步进度: ", style="bold cyan")
-            text.append(f"{completion_percent:.1f}%", style="bold white")
+            
+            # 创建进度条
+            bar_width = 20
+            filled_width = int(bar_width * completion_rate)
+            empty_width = bar_width - filled_width
+            
+            # 进度条颜色根据完成率
+            if completion_rate >= 0.95:
+                bar_color = "bold green"
+            elif completion_rate >= 0.8:
+                bar_color = "bold yellow"
+            else:
+                bar_color = "bold red"
+            
+            # 显示进度条
+            text.append("█" * filled_width, style=bar_color)
+            text.append("░" * empty_width, style="dim")
+            text.append(f" {completion_percent:.1f}%", style="bold white")
             text.append(f" ({total_pg_rows:,}/{total_mysql_rows:,})", style="dim")
             
             if completion_rate >= 1.0:
@@ -313,7 +330,7 @@ class MonitorApp(App[None]):
     }
     
     .stats {
-        height: 12;
+        height: 10;
         border: solid $primary;
         margin: 1;
         padding: 1;
@@ -535,47 +552,82 @@ class MonitorApp(App[None]):
             else:
                 icon = "⚠️"
                 
-            # 数据差异文本
+            # 数据差异文本和样式 - 使用更温和的颜色
             if t.pg_rows == -1 or t.mysql_rows == -1:
-                diff_text = "ERROR"
+                diff_text = "[bold bright_red]ERROR[/]"  # 错误状态用亮红色
             else:
-                diff_text = f"{t.data_diff:+,}" if t.data_diff != 0 else "0"
+                # 根据差异大小和方向使用不同颜色
+                if t.data_diff < 0:
+                    diff_text = f"[bold orange3]{t.data_diff:+,}[/]"  # 负数用橙色（PG落后）
+                elif t.data_diff > 0:
+                    diff_text = f"[bold spring_green3]{t.data_diff:+,}[/]"  # 正数用春绿色（PG领先）
+                else:
+                    diff_text = "[bold bright_white]0[/]"  # 零用亮白色（完全一致）
                 
-            # 变化量文本
+            # 变化量文本和样式 - 更柔和的变化指示
             if t.pg_rows == -1:
-                change_text = "ERROR"
+                change_text = "[bold bright_red]ERROR[/]"
             elif t.change > 0:
-                change_text = f"+{t.change:,} ⬆"
+                change_text = f"[bold bright_green]+{t.change:,} ⬆[/]"  # 增加用亮绿色
             elif t.change < 0:
-                change_text = f"{t.change:,} ⬇"
+                change_text = f"[bold purple]{t.change:,} ⬇[/]"  # 减少用紫色（比红色温和）
             else:
-                change_text = "0 ─"
+                change_text = "[dim white]0 ─[/]"  # 无变化用暗白色
                 
-            # MySQL状态
+            # MySQL状态和样式 - 用不同颜色表示更新状态
             if t.mysql_updating:
-                mysql_status = "更新中"
+                mysql_status = "[bold bright_yellow]更新中[/]"
             elif t.pg_updating:
-                mysql_status = "PG更新中"
+                mysql_status = "[bold bright_yellow]PG更新中[/]"
             else:
-                mysql_status = self.get_relative_time(t.mysql_last_updated)
+                relative_time = self.get_relative_time(t.mysql_last_updated)
+                if "年前" in relative_time or "个月前" in relative_time:
+                    mysql_status = f"[bold orange1]{relative_time}[/]"  # 很久没更新用橙色
+                elif "天前" in relative_time:
+                    mysql_status = f"[bold yellow3]{relative_time}[/]"  # 几天前用深黄色
+                elif "小时前" in relative_time:
+                    mysql_status = f"[bright_cyan]{relative_time}[/]"  # 几小时前用亮青色
+                else:
+                    mysql_status = f"[dim bright_white]{relative_time}[/]"  # 最近更新用暗亮白色
                 
-            # 记录数显示
-            pg_rows_display = "ERROR" if t.pg_rows == -1 else f"{'~' if t.pg_is_estimated else ''}{t.pg_rows:,}"
-            mysql_rows_display = "ERROR" if t.mysql_rows == -1 else f"{'~' if t.mysql_is_estimated else ''}{t.mysql_rows:,}"
+            # 记录数显示和样式 - 区分估计值和精确值
+            if t.pg_rows == -1:
+                pg_rows_display = "[bold bright_red]ERROR[/]"
+            elif t.pg_is_estimated:
+                pg_rows_display = f"[italic bright_blue]~{t.pg_rows:,}[/]"  # 估计值用斜体亮蓝色
+            else:
+                pg_rows_display = f"[bold bright_cyan]{t.pg_rows:,}[/]"  # 精确值用亮青色粗体
+                
+            if t.mysql_rows == -1:
+                mysql_rows_display = "[bold bright_red]ERROR[/]"
+            elif t.mysql_is_estimated:
+                mysql_rows_display = f"[italic medium_purple1]~{t.mysql_rows:,}[/]"  # 估计值用斜体中紫色
+            else:
+                mysql_rows_display = f"[bold bright_magenta]{t.mysql_rows:,}[/]"  # 精确值用亮洋红色粗体
+            
+            # Schema名称和表名样式 - 使用更清晰的颜色
+            schema_display = f"[bold medium_purple3]{t.schema_name[:12] + '...' if len(t.schema_name) > 15 else t.schema_name}[/]"  # Schema用中紫色
+            table_display = f"[bold dodger_blue2]{t.target_table_name[:35] + '...' if len(t.target_table_name) > 38 else t.target_table_name}[/]"  # 表名用道奇蓝色
+            
+            # PG更新时间样式
+            pg_time_display = f"[dim bright_black]{self.get_relative_time(t.last_updated)}[/]"  # 用亮黑色（灰色）
+            
+            # 源表数量样式
+            source_count_display = f"[dim bright_black]{len(t.mysql_source_tables)}[/]"  # 用亮黑色（灰色）
             
             # 添加行到表格
             table.add_row(
                 str(i),
                 icon,
-                t.schema_name[:12] + "..." if len(t.schema_name) > 15 else t.schema_name,
-                t.target_table_name[:35] + "..." if len(t.target_table_name) > 38 else t.target_table_name,
+                schema_display,
+                table_display,
                 pg_rows_display,
                 mysql_rows_display,
                 diff_text,
                 change_text,
-                self.get_relative_time(t.last_updated),
+                pg_time_display,
                 mysql_status,
-                str(len(t.mysql_source_tables))
+                source_count_display
             )
         
         # 尝试恢复光标位置
@@ -673,16 +725,6 @@ class MonitorApp(App[None]):
         else:
             years = total_seconds // 31536000
             return f"{years}年前"
-
-    def _signal_handler(self, signum, frame):
-        """信号处理器 - 快速响应，不等待长时间任务"""
-        self.console.print("\n[bold yellow]正在停止监控程序...[/bold yellow]")  # 警告状态 - 黄色粗体
-
-        # 设置停止标志
-        self.stop_event.set()
-
-        self.console.print("[bold yellow]监控程序已停止[/bold yellow]")  # 警告状态 - 黄色粗体
-        sys.exit(0)
 
     async def load_config(self) -> bool:
         """加载配置文件"""
@@ -1149,87 +1191,6 @@ class MonitorApp(App[None]):
                     table_info.last_updated = current_time
                     table_info.pg_is_estimated = False  # 错误状态不是估计值
 
-
-
-        with self.console.status("[bold green]正在从MySQL获取表信息...") as status:
-            target_tables = await self.initialize_tables_from_mysql()
-
-        # 显示初始化结果
-        total_tables = sum(len(tables_dict) for tables_dict in target_tables.values())
-        if total_tables > 0:
-            self.console.print(f"[green]✅ 初始化完成！发现 {total_tables} 个目标表[/green]")
-        else:
-            self.console.print("[red]❌ 未发现任何表，请检查配置[/red]")
-            return
-
-        # 第一次PostgreSQL更新
-        pg_conn = await self.connect_postgresql()
-        if pg_conn:
-            await self.get_postgresql_rows_from_pg_stat(pg_conn, target_tables)
-            await pg_conn.close()
-            self.first_pg_update = False
-
-        # 第一次MySQL更新
-        self.mysql_iteration += 1
-        await self.update_mysql_counts(target_tables, use_information_schema=True)
-        self.first_mysql_update = False
-
-        # 给用户3秒时间查看初始化信息
-        await asyncio.sleep(3)
-
-        # 启动倒计时任务
-        self.countdown_task = asyncio.create_task(self.countdown_timer())
-
-        # 主监控循环
-        try:
-            with Live(console=self.console, refresh_per_second=2) as live:  # 提高刷新率到每秒2次
-                while not self.stop_event.is_set():
-                    try:
-                        self.iteration += 1
-
-                        # 1. 更新PostgreSQL记录数（异步，不阻塞主循环）
-                        self.pg_iteration += 1
-                        # 使用异步更新，不阻塞主循环
-                        await self.update_postgresql_counts_async(target_tables)
-
-                        # 2. 按间隔更新MySQL记录数（异步，不阻塞PostgreSQL查询）
-                        if self.pg_iteration % self.mysql_update_interval == 0:
-                            self.mysql_iteration += 1
-                            # 使用异步更新，不阻塞主循环
-                            await self.update_mysql_counts_async(target_tables, use_information_schema=False)
-
-                        # 3. 将结果转换为列表格式用于显示
-                        self.tables = []
-                        for schema_name, tables_dict in target_tables.items():
-                            for table_info in tables_dict.values():
-                                self.tables.append(table_info)
-
-                        # 4. 更新进度跟踪数据
-                        self.update_progress_data(self.tables)
-
-                        # 5. 更新显示
-                        live.update(self.create_layout(self.tables))
-
-                        # 等待下次刷新（可被中断）
-                        await asyncio.sleep(self.monitor_config['refresh_interval'])
-
-                    except KeyboardInterrupt:
-                        # 在循环中捕获KeyboardInterrupt，确保能够退出
-                        break
-                    except Exception as e:
-                        if not self.stop_event.is_set():
-                            self.console.print(f"[red]监控过程中出错: {e}[/red]")
-                            await asyncio.sleep(5)
-
-        finally:
-            # 停止倒计时任务
-            if self.countdown_task:
-                self.countdown_task.cancel()
-                try:
-                    await self.countdown_task
-                except asyncio.CancelledError:
-                    pass
-            self.console.print("[green]资源清理完成[/green]")
 
 
 
