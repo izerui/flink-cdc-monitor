@@ -269,7 +269,7 @@ class StatsWidget(Static):
         
         text.append("\n")
         
-        # 进度信息和同步速度 - 带进度条
+        # 进度信息和同步速度 - 带进度条和速度估算
         if total_mysql_rows > 0:
             completion_rate = min(total_pg_rows / total_mysql_rows, 1.0)
             completion_percent = completion_rate * 100
@@ -300,6 +300,16 @@ class StatsWidget(Static):
             else:
                 remaining = total_mysql_rows - total_pg_rows
                 text.append(f" - 剩余: {remaining:,} 行", style="dim")
+                
+                # 计算同步速度和预估时间
+                if hasattr(self, 'parent_app') and self.parent_app:
+                    speed = self.parent_app.calculate_sync_speed()
+                    if speed > 0:
+                        text.append(f" - 速度: {speed:.1f} 行/秒", style="bright_blue")
+                        estimated_time = self.parent_app.estimate_remaining_time(total_mysql_rows, total_pg_rows, speed)
+                        text.append(f" - 预估: {estimated_time}", style="bright_blue")
+                    else:
+                        text.append(" - 速度: 计算中...", style="dim")
         
         self.update(text)
     
@@ -490,6 +500,7 @@ class MonitorApp(App[None]):
         """更新显示内容"""
         # 更新统计信息
         stats_widget = self.query_one(StatsWidget)
+        stats_widget.parent_app = self  # 传递app实例引用
         stats_widget.update_stats(
             self.tables, 
             self.pg_iteration, 
