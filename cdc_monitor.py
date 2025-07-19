@@ -548,8 +548,9 @@ class MonitorApp(App[None]):
         filtered_tables = self._filter_tables(self.tables)
         sorted_tables = self._sort_tables(filtered_tables)
         
-        # 保存当前光标位置
+        # 保存当前光标位置和滚动位置
         current_cursor = table.cursor_coordinate if table.row_count > 0 else None
+        current_scroll_y = table.scroll_y if hasattr(table, 'scroll_y') else 0
         
         # 清空表格并重新填充
         table.clear()
@@ -658,13 +659,31 @@ class MonitorApp(App[None]):
                 source_count_display
             )
         
-        # 尝试恢复光标位置
+        # 尝试恢复光标位置和滚动位置
         if current_cursor is not None and table.row_count > 0:
             try:
+                # 恢复光标位置
                 new_row = min(current_cursor.row, table.row_count - 1)
                 table.move_cursor(row=new_row)
-            except:
-                pass
+                
+                # 多种方式尝试恢复滚动位置
+                self.call_after_refresh(self._restore_scroll_position, table, current_scroll_y)
+                    
+            except Exception:
+                pass  # 如果恢复失败，保持默认位置
+    
+    def _restore_scroll_position(self, table: DataTable, scroll_y: int):
+        """恢复滚动位置的辅助方法"""
+        try:
+            # 尝试多种方式恢复滚动位置
+            if hasattr(table, 'scroll_y'):
+                table.scroll_y = scroll_y
+            if hasattr(table, 'scroll_to'):
+                table.scroll_to(y=scroll_y, animate=False)
+            if hasattr(table, 'scroll_offset'):
+                table.scroll_offset = table.scroll_offset.replace(y=scroll_y)
+        except Exception:
+            pass  # 静默失败，不影响正常功能
     
     async def refresh_data(self):
         """定时刷新数据"""
