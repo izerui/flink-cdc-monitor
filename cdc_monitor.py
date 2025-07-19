@@ -435,7 +435,7 @@ class MonitorApp(App[None]):
         table.add_columns(
             "序号", "状态", "SCHEMA", "目标表名", "PG记录数", 
             "MySQL汇总数", "数据差异", "变化量", "PG更新时间", 
-            "MySQL状态", "源表数量"
+            "MySQL更新时间", "源表数量"
         )
         
         # 启动监控任务
@@ -574,17 +574,15 @@ class MonitorApp(App[None]):
             else:
                 change_text = "[dim white]0 ─[/]"  # 无变化用暗白色
                 
-            # MySQL状态和样式 - 用不同颜色表示更新状态
+            # MySQL更新时间和样式
             if t.mysql_updating:
                 mysql_status = "[bold bright_yellow]更新中[/]"
-            elif t.pg_updating:
-                mysql_status = "[bold bright_yellow]PG更新中[/]"
             else:
                 relative_time = self.get_relative_time(t.mysql_last_updated)
                 if "年前" in relative_time or "个月前" in relative_time:
                     mysql_status = f"[bold orange1]{relative_time}[/]"  # 很久没更新用橙色
                 elif "天前" in relative_time:
-                    mysql_status = f"[bold yellow3]{relative_time}[/]"  # 几天前用深黄色
+                    mysql_status = f"[bold yellow3]{relative_time}[/]"  # 几天前用深黄色  
                 elif "小时前" in relative_time:
                     mysql_status = f"[bright_cyan]{relative_time}[/]"  # 几小时前用亮青色
                 else:
@@ -609,8 +607,19 @@ class MonitorApp(App[None]):
             schema_display = f"[bold medium_purple3]{t.schema_name[:12] + '...' if len(t.schema_name) > 15 else t.schema_name}[/]"  # Schema用中紫色
             table_display = f"[bold dodger_blue2]{t.target_table_name[:35] + '...' if len(t.target_table_name) > 38 else t.target_table_name}[/]"  # 表名用道奇蓝色
             
-            # PG更新时间样式
-            pg_time_display = f"[dim bright_black]{self.get_relative_time(t.last_updated)}[/]"  # 用亮黑色（灰色）
+            # PG更新时间样式 - 区分更新状态
+            if t.pg_updating:
+                pg_time_display = "[bold bright_yellow]更新中[/]"
+            else:
+                pg_relative_time = self.get_relative_time(t.last_updated)
+                if "年前" in pg_relative_time or "个月前" in pg_relative_time:
+                    pg_time_display = f"[bold orange1]{pg_relative_time}[/]"  # 很久没更新用橙色
+                elif "天前" in pg_relative_time:
+                    pg_time_display = f"[bold yellow3]{pg_relative_time}[/]"  # 几天前用深黄色
+                elif "小时前" in pg_relative_time:
+                    pg_time_display = f"[bright_cyan]{pg_relative_time}[/]"  # 几小时前用亮青色
+                else:
+                    pg_time_display = f"[dim bright_black]{pg_relative_time}[/]"  # 最近更新用暗色
             
             # 源表数量样式
             source_count_display = f"[dim bright_black]{len(t.mysql_source_tables)}[/]"  # 用亮黑色（灰色）
@@ -659,6 +668,9 @@ class MonitorApp(App[None]):
         if self.pg_iteration % self.mysql_update_interval == 0:
             self.mysql_iteration += 1
             await self.update_mysql_counts_async(target_tables, use_information_schema=False)
+            
+        # 更新进度跟踪数据
+        self.update_progress_data(self.tables)
             
         # 更新显示
         self.update_display()
@@ -725,6 +737,72 @@ class MonitorApp(App[None]):
         else:
             years = total_seconds // 31536000
             return f"{years}年前"
+
+    def update_progress_data(self, tables: List[TableInfo]):
+        """更新进度数据，计算总数和变化量"""
+        current_time = datetime.now()
+
+        # 过滤掉错误状态的表进行统计
+        valid_tables = [t for t in tables if t.pg_rows != -1 and t.mysql_rows != -1]
+
+        total_pg_rows = sum(t.pg_rows for t in valid_tables)
+        total_mysql_rows = sum(t.mysql_rows for t in valid_tables)
+        total_pg_change = sum(t.change for t in valid_tables)
+
+        # 添加到历史数据
+        self.history_data.append((current_time, total_pg_rows, total_mysql_rows, total_pg_change))
+
+        # 保持历史数据在指定范围内
+        if len(self.history_data) > self.max_history_points:
+            self.history_data.pop(0)
+
+    def calculate_sync_speed(self) -> float:
+        """计算同步速度（记录/秒）"""
+        if len(self.history_data) < 2:
+            return 0.0
+
+        # 使用最近的数据点计算速度
+        recent_data = self.history_data[-min(10, len(self.history_data)):]
+
+        if len(recent_data) < 2:
+            return 0.0
+
+        # 计算时间跨度和总变化量
+        time_span = (recent_data[-1][0] - recent_data[0][0]).total_seconds()
+        if time_span <= 0:
+            return 0.0
+
+        # 计算PostgreSQL总变化量（所有数据点的变化量之和）
+        total_change = sum(data[3] for data in recent_data if data[3] > 0)  # 只计算正向变化
+
+        return total_change / time_span if time_span > 0 else 0.0
+
+    def estimate_remaining_time(self, mysql_total: int, pg_total: int, speed: float) -> str:
+        """估算剩余时间"""
+        if speed <= 0 or mysql_total <= 0:
+            return "无法估算"
+
+        # 计算还需要同步的记录数
+        remaining_records = mysql_total - pg_total
+        if remaining_records <= 0:
+            return "已完成"
+
+        remaining_seconds = remaining_records / speed
+
+        if remaining_seconds < 60:
+            return f"{int(remaining_seconds)}秒"
+        elif remaining_seconds < 3600:
+            minutes = int(remaining_seconds // 60)
+            seconds = int(remaining_seconds % 60)
+            return f"{minutes}分{seconds}秒"
+        elif remaining_seconds < 86400:
+            hours = int(remaining_seconds // 3600)
+            minutes = int((remaining_seconds % 3600) // 60)
+            return f"{hours}小时{minutes}分钟"
+        else:
+            days = int(remaining_seconds // 86400)
+            hours = int((remaining_seconds % 86400) // 3600)
+            return f"{days}天{hours}小时"
 
     async def load_config(self) -> bool:
         """加载配置文件"""
