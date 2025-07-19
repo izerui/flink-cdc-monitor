@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PostgreSQL数据库监控工具
-使用Rich库提供丰富的终端显示效果
-异步版本 - 使用asyncio提升性能
+PostgreSQL数据库监控工具 - Textual版本
+使用Textual框架提供现代化的TUI界面，支持DataTable滚动查看
 """
 
 import argparse
@@ -19,16 +18,11 @@ from typing import Dict, List, Optional
 
 import aiomysql
 import asyncpg
-from rich import box
-from rich.align import Align
-from rich.columns import Columns
-from rich.console import Console
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
-from rich.theme import Theme
+from textual.app import App, ComposeResult
+from textual.containers import Container, Vertical
+from textual.timer import Timer
+from textual.widgets import DataTable, Footer, Header, Static
 
 
 @dataclass
@@ -185,87 +179,472 @@ class SyncProperties:
         return table_name  # 没有找到UUID模式，返回原表名
 
 
-class PostgreSQLMonitor:
-    """PostgreSQL监控器"""
+class StatsWidget(Static):
+    """统计信息组件"""
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+    def update_stats(self, tables: List[TableInfo], pg_iteration: int, mysql_iteration: int, start_time: datetime, 
+                    is_paused: bool = False, sort_by: str = "schema_table", filter_mode: str = "all"):
+        """更新统计数据"""
+        # 过滤掉错误状态的表进行统计
+        valid_tables = [t for t in tables if t.pg_rows != -1 and t.mysql_rows != -1]
+        error_tables = [t for t in tables if t.pg_rows == -1 or t.mysql_rows == -1]
 
+        total_pg_rows = sum(t.pg_rows for t in valid_tables)
+        total_mysql_rows = sum(t.mysql_rows for t in valid_tables)
+        total_diff = total_pg_rows - total_mysql_rows
+        total_changes = sum(t.change for t in valid_tables)
+        changed_count = len([t for t in valid_tables if t.change != 0])
+
+        # 一致性统计
+        consistent_count = len([t for t in tables if t.is_consistent])
+        inconsistent_count = len(tables) - consistent_count
+
+        # 运行时长
+        runtime = datetime.now() - start_time
+        runtime_str = self._format_duration(runtime.total_seconds())
+
+        # 构建显示文本
+        text = Text()
+        
+        # 标题行
+        text.append("🔍 PostgreSQL 数据库监控", style="bold blue")
+        text.append(f" - PG第{pg_iteration}次/MySQL第{mysql_iteration}次", style="dim")
+        text.append(f" - 运行时长: {runtime_str}", style="cyan")
+        
+        # 状态和排序信息
+        if is_paused:
+            text.append(" - ", style="dim")
+            text.append("⏸️ 已暂停", style="bold yellow")
+        
+        # 排序和过滤信息
+        sort_display = {
+            "schema_table": "Schema.表名",
+            "data_diff": "数据差异", 
+            "pg_rows": "PG记录数",
+            "mysql_rows": "MySQL记录数"
+        }
+        filter_display = {
+            "all": "全部",
+            "inconsistent": "不一致",
+            "consistent": "一致", 
+            "error": "错误"
+        }
+        text.append(f" - 排序: {sort_display.get(sort_by, sort_by)}", style="dim")
+        text.append(f" - 过滤: {filter_display.get(filter_mode, filter_mode)}", style="dim")
+        text.append(f" - 总计: {len(tables)} 个表", style="dim")
+        text.append("\n\n")
+        
+        # 数据量统计
+        text.append("📈 数据统计: ", style="bold")
+        text.append(f"PG总计: {total_pg_rows:,} 行, ", style="white")
+        text.append(f"MySQL总计: {total_mysql_rows:,} 行, ", style="white")
+        
+        # 数据差异颜色语义化
+        if total_diff < 0:
+            text.append(f"数据差异: {total_diff:+,} 行", style="bold red")
+        elif total_diff > 0:
+            text.append(f"数据差异: {total_diff:+,} 行", style="bold green")
+        else:
+            text.append(f"数据差异: {total_diff:+,} 行", style="white")
+        text.append("\n")
+        
+        # 变化和一致性统计
+        if total_changes > 0:
+            text.append(f"🔄 本轮变化: +{total_changes:,} 行", style="bold green")
+        elif total_changes < 0:
+            text.append(f"🔄 本轮变化: {total_changes:+,} 行", style="bold red")
+        else:
+            text.append(f"🔄 本轮变化: {total_changes:+,} 行", style="white")
+        
+        text.append(f" ({changed_count} 个表有变化), ", style="white")
+        text.append(f"一致性: {consistent_count} 个一致", style="bold green")
+        
+        if inconsistent_count > 0:
+            text.append(f", {inconsistent_count} 个不一致", style="bold red")
+        if len(error_tables) > 0:
+            text.append(f", {len(error_tables)} 个错误", style="bold red")
+        
+        text.append("\n")
+        
+        # 进度信息和同步速度
+        if total_mysql_rows > 0:
+            completion_rate = min(total_pg_rows / total_mysql_rows, 1.0)
+            completion_percent = completion_rate * 100
+            
+            text.append("📊 同步进度: ", style="bold cyan")
+            text.append(f"{completion_percent:.1f}%", style="bold white")
+            text.append(f" ({total_pg_rows:,}/{total_mysql_rows:,})", style="dim")
+            
+            if completion_rate >= 1.0:
+                text.append(" - 已完成", style="bold green")
+            else:
+                remaining = total_mysql_rows - total_pg_rows
+                text.append(f" - 剩余: {remaining:,} 行", style="dim")
+        
+        self.update(text)
+    
+    def _format_duration(self, seconds: float) -> str:
+        """格式化时长显示"""
+        if seconds < 60:
+            return f"{int(seconds)}秒"
+        elif seconds < 3600:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}分{secs}秒"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}小时{minutes}分钟"
+        else:
+            days = int(seconds // 86400)
+            hours = int((seconds % 86400) // 3600)
+            return f"{days}天{hours}小时"
+
+
+class MonitorApp(App[None]):
+    """监控应用主类"""
+    
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+    
+    .stats {
+        height: 12;
+        border: solid $primary;
+        margin: 1;
+        padding: 1;
+        background: $surface;
+    }
+    
+    .data-table {
+        height: 1fr;
+        border: solid $primary;
+        margin: 1;
+        background: $surface;
+    }
+    
+    .data-table > DataTable {
+        background: $surface;
+        scrollbar-background: $surface;
+        scrollbar-color: $primary;
+        scrollbar-corner-color: $surface;
+    }
+    
+    DataTable > .datatable--cursor {
+        background: $accent 50%;
+    }
+    
+    DataTable > .datatable--hover {
+        background: $primary 20%;
+    }
+    """
+    
+    BINDINGS = [
+        ("q", "quit", "退出"),
+        ("r", "refresh", "手动刷新"),
+        ("space", "toggle_pause", "暂停/继续"),
+        ("s", "sort_toggle", "切换排序"),
+        ("f", "filter_toggle", "切换过滤"),
+        ("ctrl+c", "quit", "退出"),
+    ]
+    
     def __init__(self, config_file: str = "config.ini", override_databases: Optional[List[str]] = None):
-        # 定义颜色主题 - 白色背景专业监控界面风格
-        self.theme = Theme({
-            # 基础状态颜色 - 确保白色背景下的高对比度
-            "success": "bold green",  # 健康/正常状态 - 绿色粗体
-            "error": "bold red",  # 错误/危险状态 - 红色粗体
-            "warning": "bold yellow",  # 警告状态 - 黄色粗体
-            "info": "bright_blue",  # 信息提示 - 亮蓝色
-            "normal": "black",  # 普通文本 - 黑色（白背景下可读）
-            "dim_text": "bright_black",  # 次要信息 - 亮黑色（灰色效果）
-
-            # 数据状态颜色 - 语义化状态指示
-            "consistent": "bold green",  # 数据一致 - 绿色粗体
-            "inconsistent": "bold red",  # 数据不一致 - 红色粗体
-            "updating": "bold yellow",  # 更新中 - 黄色粗体
-            "unchanged": "black",  # 无变化 - 黑色
-
-            # 界面元素颜色 - 专业监控风格
-            "header": "bold blue",  # 主标题 - 深蓝色粗体，权威感
-            "panel_border": "blue",  # 主边框 - 蓝色边框
-            "stats_border": "bold cyan",  # 统计边框 - 青色粗体边框
-            "footer_border": "bright_black",  # 底部边框 - 亮黑色
-            "table_header": "bold white on black",  # 表头 - 黑底白字，醒目
-
-            # 数据字段颜色 - 清晰的数据展示
-            "schema_name": "magenta",  # Schema名称 - 洋红色
-            "table_name": "blue",  # 表名 - 蓝色
-            "progress": "bright_blue",  # 进度信息 - 亮蓝色
-            "speed": "bright_blue",  # 速度指标 - 亮蓝色
-            "estimate": "dim blue"  # 估算信息 - 暗蓝色
-        })
-
-        self.console = Console(theme=self.theme)
+        super().__init__()
         self.config_file = config_file
-        self.override_databases = override_databases  # 命令行传入的数据库列表
+        self.override_databases = override_databases
         self.pg_config = None
         self.mysql_config = None
         self.monitor_config = {}
         self.tables: List[TableInfo] = []
         self.iteration = 0
         self.sync_props = SyncProperties()
-        self.start_time = datetime.now()  # 程序启动时间
+        self.start_time = datetime.now()
 
         # 分离的更新计数器
-        self.pg_iteration = 0  # PostgreSQL更新次数
-        self.mysql_iteration = 0  # MySQL更新次数
-        self.mysql_update_interval = 3  # MySQL更新间隔（相对于PostgreSQL）
-        self.first_mysql_update = True  # 标记是否是第一次MySQL更新
-        self.first_pg_update = True  # 标记是否是第一次PostgreSQL更新
-        self.pg_updating = False  # PostgreSQL是否正在更新中
+        self.pg_iteration = 0
+        self.mysql_iteration = 0
+        self.mysql_update_interval = 3
+        self.first_mysql_update = True
+        self.first_pg_update = True
+        self.pg_updating = False
 
         # 停止标志，用于优雅退出
         self.stop_event = asyncio.Event()
 
-        # 异步MySQL更新支持
+        # 异步更新支持
         self.mysql_update_lock = asyncio.Lock()
-        self.mysql_update_tasks = []  # 跟踪正在进行的MySQL更新任务
-        
-        # 异步PostgreSQL更新支持
+        self.mysql_update_tasks = []
         self.pg_update_lock = asyncio.Lock()
-        self.pg_update_tasks = []  # 跟踪正在进行的PostgreSQL更新任务
+        self.pg_update_tasks = []
 
-        # 进度跟踪 - 用于计算同步速度和预估时间
-        self.history_data = []  # 存储历史数据: [(时间戳, pg_total, mysql_total, pg_change)]
-        self.max_history_points = 20  # 保留最近20个数据点用于计算速度
+        # 进度跟踪
+        self.history_data = []
+        self.max_history_points = 20
 
-        # 分页相关属性
-        self.current_page = 1  # 当前页码
-        self.page_size = 20  # 每页显示的表数量
-        self.page_interval = 10  # 翻页间隔（秒）
-        self.last_page_change = datetime.now()  # 上次翻页时间
-        self.countdown_task = None  # 倒计时任务
-        self.remaining_seconds = 10  # 剩余秒数，初始化为默认值，加载配置后会更新
-        self.countdown_event = asyncio.Event()  # 用于控制倒计时任务
+        # 定时器
+        self.refresh_timer: Optional[Timer] = None
+
+        # 界面控制属性
+        self.is_paused = False
+        self.sort_by = "schema_table"  # 可选: schema_table, data_diff, pg_rows, mysql_rows
+        self.filter_mode = "all"  # 可选: all, inconsistent, consistent, error
 
         # 信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        
+    def compose(self) -> ComposeResult:
+        """构建UI组件"""
+        yield Header()
+        
+        with Vertical():
+            # 统计信息面板
+            yield StatsWidget(classes="stats")
+            
+            # 数据表格容器
+            with Container(classes="data-table"):
+                yield DataTable(id="tables")
+        
+        yield Footer()
+    
+    def on_mount(self) -> None:
+        """应用启动时的初始化"""
+        # 设置数据表格
+        table = self.query_one("#tables", DataTable)
+        table.add_columns(
+            "序号", "状态", "SCHEMA", "目标表名", "PG记录数", 
+            "MySQL汇总数", "数据差异", "变化量", "PG更新时间", 
+            "MySQL状态", "源表数量"
+        )
+        
+        # 启动监控任务
+        self.call_later(self.start_monitoring)
+        
+    async def start_monitoring(self):
+        """启动监控任务"""
+        if not await self.load_config():
+            self.exit(1)
+            return
+            
+        # 初始化数据库连接测试
+        pg_conn = await self.connect_postgresql()
+        if not pg_conn:
+            self.exit(1)
+            return
+        await pg_conn.close()
+        
+        # 初始化表结构
+        target_tables = await self.initialize_tables_from_mysql()
+        total_tables = sum(len(tables_dict) for tables_dict in target_tables.values())
+        
+        if total_tables == 0:
+            self.exit(1)
+            return
+            
+        # 第一次数据更新
+        pg_conn = await self.connect_postgresql()
+        if pg_conn:
+            await self.get_postgresql_rows_from_pg_stat(pg_conn, target_tables)
+            await pg_conn.close()
+            self.first_pg_update = False
+            
+        self.mysql_iteration += 1
+        await self.update_mysql_counts(target_tables, use_information_schema=True)
+        self.first_mysql_update = False
+        
+        # 转换为列表格式
+        self.tables = []
+        for schema_name, tables_dict in target_tables.items():
+            for table_info in tables_dict.values():
+                self.tables.append(table_info)
+                
+        # 更新显示
+        self.update_display()
+        
+        # 启动定时刷新
+        refresh_interval = self.monitor_config.get('refresh_interval', 3)
+        self.refresh_timer = self.set_interval(refresh_interval, self.refresh_data)
+        
+    def update_display(self):
+        """更新显示内容"""
+        # 更新统计信息
+        stats_widget = self.query_one(StatsWidget)
+        stats_widget.update_stats(
+            self.tables, 
+            self.pg_iteration, 
+            self.mysql_iteration, 
+            self.start_time,
+            self.is_paused,
+            self.sort_by,
+            self.filter_mode
+        )
+        
+        # 更新数据表格
+        self._update_data_table()
+    
+    def _filter_tables(self, tables: List[TableInfo]) -> List[TableInfo]:
+        """根据当前过滤模式过滤表格"""
+        if self.filter_mode == "inconsistent":
+            return [t for t in tables if not t.is_consistent]
+        elif self.filter_mode == "consistent":
+            return [t for t in tables if t.is_consistent]
+        elif self.filter_mode == "error":
+            return [t for t in tables if t.pg_rows == -1 or t.mysql_rows == -1]
+        else:  # all
+            return tables
+    
+    def _sort_tables(self, tables: List[TableInfo]) -> List[TableInfo]:
+        """根据当前排序方式对表格进行排序"""
+        if self.sort_by == "data_diff":
+            # 按数据差异排序，差异大的在前
+            return sorted(tables, key=lambda t: abs(t.data_diff) if t.data_diff != 0 else -1, reverse=True)
+        elif self.sort_by == "pg_rows":
+            # 按PG记录数排序，多的在前
+            return sorted(tables, key=lambda t: t.pg_rows if t.pg_rows != -1 else -1, reverse=True)
+        elif self.sort_by == "mysql_rows":
+            # 按MySQL记录数排序，多的在前
+            return sorted(tables, key=lambda t: t.mysql_rows if t.mysql_rows != -1 else -1, reverse=True)
+        else:  # schema_table
+            # 按schema名和表名排序
+            return sorted(tables, key=lambda t: (t.schema_name, t.target_table_name))
+    
+    def _update_data_table(self):
+        """更新数据表格"""
+        table = self.query_one("#tables", DataTable)
+        
+        # 先过滤再排序
+        filtered_tables = self._filter_tables(self.tables)
+        sorted_tables = self._sort_tables(filtered_tables)
+        
+        # 保存当前光标位置
+        current_cursor = table.cursor_coordinate if table.row_count > 0 else None
+        
+        # 清空表格并重新填充
+        table.clear()
+        
+        for i, t in enumerate(sorted_tables, 1):
+            # 状态图标
+            if t.pg_rows == -1 or t.mysql_rows == -1:
+                icon = "❌"
+            elif t.is_consistent:
+                icon = "✅"
+            else:
+                icon = "⚠️"
+                
+            # 数据差异文本
+            if t.pg_rows == -1 or t.mysql_rows == -1:
+                diff_text = "ERROR"
+            else:
+                diff_text = f"{t.data_diff:+,}" if t.data_diff != 0 else "0"
+                
+            # 变化量文本
+            if t.pg_rows == -1:
+                change_text = "ERROR"
+            elif t.change > 0:
+                change_text = f"+{t.change:,} ⬆"
+            elif t.change < 0:
+                change_text = f"{t.change:,} ⬇"
+            else:
+                change_text = "0 ─"
+                
+            # MySQL状态
+            if t.mysql_updating:
+                mysql_status = "更新中"
+            elif t.pg_updating:
+                mysql_status = "PG更新中"
+            else:
+                mysql_status = self.get_relative_time(t.mysql_last_updated)
+                
+            # 记录数显示
+            pg_rows_display = "ERROR" if t.pg_rows == -1 else f"{'~' if t.pg_is_estimated else ''}{t.pg_rows:,}"
+            mysql_rows_display = "ERROR" if t.mysql_rows == -1 else f"{'~' if t.mysql_is_estimated else ''}{t.mysql_rows:,}"
+            
+            # 添加行到表格
+            table.add_row(
+                str(i),
+                icon,
+                t.schema_name[:12] + "..." if len(t.schema_name) > 15 else t.schema_name,
+                t.target_table_name[:35] + "..." if len(t.target_table_name) > 38 else t.target_table_name,
+                pg_rows_display,
+                mysql_rows_display,
+                diff_text,
+                change_text,
+                self.get_relative_time(t.last_updated),
+                mysql_status,
+                str(len(t.mysql_source_tables))
+            )
+        
+        # 尝试恢复光标位置
+        if current_cursor is not None and table.row_count > 0:
+            try:
+                new_row = min(current_cursor.row, table.row_count - 1)
+                table.move_cursor(row=new_row)
+            except:
+                pass
+    
+    async def refresh_data(self):
+        """定时刷新数据"""
+        if self.stop_event.is_set() or self.is_paused:
+            return
+            
+        # 重新构建target_tables结构用于更新
+        target_tables = {}
+        for table_info in self.tables:
+            schema_name = table_info.schema_name
+            if schema_name not in target_tables:
+                target_tables[schema_name] = {}
+            target_tables[schema_name][table_info.target_table_name] = table_info
+            
+        # 更新PostgreSQL记录数
+        self.pg_iteration += 1
+        await self.update_postgresql_counts_async(target_tables)
+        
+        # 按间隔更新MySQL记录数
+        if self.pg_iteration % self.mysql_update_interval == 0:
+            self.mysql_iteration += 1
+            await self.update_mysql_counts_async(target_tables, use_information_schema=False)
+            
+        # 更新显示
+        self.update_display()
+        
+    def action_quit(self) -> None:
+        """退出应用"""
+        self.stop_event.set()
+        if self.refresh_timer:
+            self.refresh_timer.stop()
+        self.exit()
+        
+    def action_refresh(self) -> None:
+        """手动刷新"""
+        self.call_later(self.refresh_data)
+        
+    def action_toggle_pause(self) -> None:
+        """暂停/继续监控"""
+        self.is_paused = not self.is_paused
+        self.update_display()
+                
+    def action_sort_toggle(self) -> None:
+        """切换排序方式"""
+        sort_options = ["schema_table", "data_diff", "pg_rows", "mysql_rows"]
+        current_index = sort_options.index(self.sort_by)
+        self.sort_by = sort_options[(current_index + 1) % len(sort_options)]
+        self.update_display()
+        
+    def action_filter_toggle(self) -> None:
+        """切换过滤方式"""
+        filter_options = ["all", "inconsistent", "consistent", "error"]
+        current_index = filter_options.index(self.filter_mode)
+        self.filter_mode = filter_options[(current_index + 1) % len(filter_options)]
+        self.update_display()
+        
+    def _signal_handler(self, signum, frame):
+        """信号处理器"""
+        self.stop_event.set()
+        self.exit()
 
     def get_relative_time(self, target_time: datetime) -> str:
         """获取相对时间显示"""
@@ -305,11 +684,10 @@ class PostgreSQLMonitor:
         self.console.print("[bold yellow]监控程序已停止[/bold yellow]")  # 警告状态 - 黄色粗体
         sys.exit(0)
 
-    def load_config(self) -> bool:
+    async def load_config(self) -> bool:
         """加载配置文件"""
         config_path = Path(self.config_file)
         if not config_path.exists():
-            self.console.print(f"[bold red]配置文件不存在: {config_path}[/bold red]")  # 错误状态 - 红色粗体
             return False
 
         try:
@@ -328,21 +706,15 @@ class PostgreSQLMonitor:
 
             # MySQL配置
             mysql_section = config['mysql']
-
-            # 如果有命令行传入的数据库列表，使用它覆盖配置文件
             if self.override_databases:
                 databases_list = self.override_databases
-                self.console.print(
-                    f"[bright_blue]使用命令行指定的数据库: {', '.join(databases_list)}[/bright_blue]")  # 信息提示 - 亮蓝色
             else:
                 databases_list = mysql_section['databases'].split(',')
-                self.console.print(
-                    f"[bright_blue]使用配置文件中的数据库: {', '.join(databases_list)}[/bright_blue]")  # 信息提示 - 亮蓝色
 
             self.mysql_config = MySQLConfig(
                 host=mysql_section['host'],
                 port=int(mysql_section['port']),
-                database="",  # 会动态切换
+                database="",
                 username=mysql_section['username'],
                 password=mysql_section['password'],
                 databases=databases_list,
@@ -353,26 +725,13 @@ class PostgreSQLMonitor:
             monitor_section = config['monitor']
             self.monitor_config = {
                 'refresh_interval': int(monitor_section.get('refresh_interval', 3)),
-                'enable_clear_screen': monitor_section.getboolean('enable_clear_screen', True),
                 'mysql_update_interval': int(monitor_section.get('mysql_update_interval', 3)),
-                'page_size': int(monitor_section.get('page_size', 20)),
-                'page_interval': int(monitor_section.get('page_interval', 10))
             }
 
-            # 更新MySQL更新间隔
             self.mysql_update_interval = self.monitor_config['mysql_update_interval']
-            
-            # 更新分页配置
-            self.page_size = self.monitor_config['page_size']
-            self.page_interval = self.monitor_config['page_interval']
-            
-            # 重新初始化剩余秒数，确保使用配置文件中的值
-            self.remaining_seconds = self.page_interval
-
             return True
 
         except Exception as e:
-            self.console.print(f"[bold red]配置文件加载失败: {e}[/bold red]")  # 错误状态 - 红色粗体
             return False
 
     async def connect_postgresql(self):
@@ -388,11 +747,10 @@ class PostgreSQLMonitor:
             )
             return conn
         except Exception as e:
-            self.console.print(f"[red]PostgreSQL连接失败: {e}[/red]")
             return None
 
     async def connect_mysql(self, database: str):
-        """连接MySQL - 使用更短的超时时间"""
+        """连接MySQL"""
         try:
             conn = await aiomysql.connect(
                 host=self.mysql_config.host,
@@ -400,68 +758,55 @@ class PostgreSQLMonitor:
                 db=database,
                 user=self.mysql_config.username,
                 password=self.mysql_config.password,
-                connect_timeout=5,  # 减少连接超时时间：10秒 -> 5秒
+                connect_timeout=5,
                 charset='utf8mb4'
             )
             return conn
         except Exception as e:
-            self.console.print(f"[red]MySQL连接失败 ({database}): {e}[/red]")
             return None
 
     async def initialize_tables_from_mysql(self):
-        """
-        从MySQL初始化表结构（不获取count）
-        返回: {schema_name: {target_table_name: TableInfo}}
-        """
+        """从MySQL初始化表结构"""
         schema_tables = {}
-        total_databases = len([db for db in self.mysql_config.databases if db.strip()])
-
-        for i, schema_name in enumerate(self.mysql_config.databases, 1):
+        
+        for schema_name in self.mysql_config.databases:
             schema_name = schema_name.strip()
             if not schema_name:
                 continue
 
-            # 显示当前处理的数据库进度
-            self.console.print(f"[dim]正在处理数据库 {i}/{total_databases}: {schema_name}[/dim]")
-
             mysql_conn = await self.connect_mysql(schema_name)
             if not mysql_conn:
-                self.console.print(f"[red]  ❌ 连接失败: {schema_name}[/red]")
                 continue
 
             try:
-                # 获取MySQL表列表
                 async with mysql_conn.cursor() as cursor:
                     await cursor.execute("""
-                                         SELECT TABLE_NAME
-                                         FROM INFORMATION_SCHEMA.TABLES
-                                         WHERE TABLE_SCHEMA = %s
-                                           AND TABLE_TYPE = 'BASE TABLE'
-                                         """, (schema_name,))
+                        SELECT TABLE_NAME
+                        FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = %s
+                          AND TABLE_TYPE = 'BASE TABLE'
+                    """, (schema_name,))
 
                     mysql_table_names = []
                     rows = await cursor.fetchall()
                     for row in rows:
                         table_name = row[0]
-                        # 过滤忽略的表
                         if not any(table_name.startswith(prefix.strip())
-                                   for prefix in self.mysql_config.ignored_prefixes if prefix.strip()):
+                                 for prefix in self.mysql_config.ignored_prefixes if prefix.strip()):
                             mysql_table_names.append(table_name)
 
                 # 按目标表名分组
                 target_tables = {}
                 for mysql_table_name in mysql_table_names:
-                    # 计算目标表名
                     target_table_name = self.sync_props.get_target_table_name(mysql_table_name)
 
-                    # 如果目标表已存在，添加源表；否则创建新的TableInfo
                     if target_table_name not in target_tables:
                         current_time = datetime.now()
                         target_tables[target_table_name] = TableInfo(
                             schema_name=schema_name,
                             target_table_name=target_table_name,
-                            mysql_rows=0,  # 初始为0，后续更新
-                            mysql_last_updated=current_time - timedelta(days=365),  # 设置为很久以前
+                            mysql_rows=0,
+                            mysql_last_updated=current_time - timedelta(days=365),
                             last_updated=current_time
                         )
                         target_tables[target_table_name].mysql_source_tables.append(mysql_table_name)
@@ -470,56 +815,13 @@ class PostgreSQLMonitor:
 
                 if target_tables:
                     schema_tables[schema_name] = target_tables
-                    self.console.print(f"[green]  ✅ 成功: {schema_name} ({len(target_tables)} 个目标表)[/green]")
-                else:
-                    self.console.print(f"[yellow]  ⚠️  无表: {schema_name}[/yellow]")
 
             finally:
                 mysql_conn.close()
 
         return schema_tables
 
-    async def get_mysql_rows_from_information_schema(self, target_tables: Dict[str, Dict[str, TableInfo]]):
-        """第一次运行时使用information_schema快速获取MySQL表行数估计值"""
-        current_time = datetime.now()
 
-        for schema_name, tables_dict in target_tables.items():
-            mysql_conn = await self.connect_mysql(schema_name)
-            if not mysql_conn:
-                continue
-
-            try:
-                async with mysql_conn.cursor() as cursor:
-                    # 使用information_schema.tables一次性获取所有表的行数估计
-                    await cursor.execute("""
-                                         SELECT table_name, table_rows
-                                         FROM information_schema.tables
-                                         WHERE table_schema = %s
-                                           AND table_type = 'BASE TABLE'
-                                         ORDER BY table_rows DESC
-                                         """, (schema_name,))
-
-                    # 建立表名到行数的映射
-                    table_rows_map = {}
-                    rows = await cursor.fetchall()
-                    for row in rows:
-                        table_name, table_rows = row
-                        table_rows_map[table_name] = table_rows or 0  # 处理NULL值
-
-                # 更新TableInfo中的MySQL行数
-                for table_info in tables_dict.values():
-                    table_info.mysql_rows = 0  # 重置
-
-                    # 累加所有源表的估计行数
-                    for mysql_table_name in table_info.mysql_source_tables:
-                        if mysql_table_name in table_rows_map:
-                            table_info.mysql_rows += table_rows_map[mysql_table_name]
-
-                    table_info.mysql_last_updated = current_time
-                    table_info.mysql_is_estimated = True  # 标记为估计值
-
-            finally:
-                mysql_conn.close()
 
     async def _update_single_schema_mysql(self, schema_name: str, tables_dict: Dict[str, TableInfo],
                                           use_information_schema: bool = False) -> bool:
@@ -847,243 +1149,7 @@ class PostgreSQLMonitor:
                     table_info.last_updated = current_time
                     table_info.pg_is_estimated = False  # 错误状态不是估计值
 
-    def create_header_panel(self) -> Panel:
-        """创建标题面板"""
-        title_text = Text()
-        title_text.append("🔍 PostgreSQL 数据库监控", style="header")  # 主标题 - 深蓝色粗体
-        title_text.append(f" - PG第{self.pg_iteration}次/MySQL第{self.mysql_iteration}次",
-                          style="dim_text")  # 副标题 - 暗灰色
 
-        time_text = Text()
-        time_text.append("⏰ 运行时长: ", style="dim_text")  # 标签 - 暗灰色
-        runtime_text = self.get_relative_time(self.start_time).rstrip("前")
-        time_text.append(runtime_text, style="info")  # 时间显示 - 亮蓝色，重要信息
-
-        header_content = Align.center(Columns([title_text, time_text], equal=True))
-        return Panel(header_content, box=box.ROUNDED, style="panel_border")
-
-    def create_combined_stats_panel(self, tables: List[TableInfo]) -> Panel:
-        """创建合并的统计面板"""
-        # 过滤掉错误状态的表进行统计
-        valid_tables = [t for t in tables if t.pg_rows != -1 and t.mysql_rows != -1]
-        error_tables = [t for t in tables if t.pg_rows == -1 or t.mysql_rows == -1]
-
-        total_pg_rows = sum(t.pg_rows for t in valid_tables)
-        total_mysql_rows = sum(t.mysql_rows for t in valid_tables)
-        total_diff = total_pg_rows - total_mysql_rows
-        total_changes = sum(t.change for t in valid_tables)
-        changed_count = len([t for t in valid_tables if t.change != 0])
-
-        # 按schema分组统计
-        schema_stats = {}
-        for table in tables:
-            if table.schema_name not in schema_stats:
-                schema_stats[table.schema_name] = {
-                    'count': 0, 'pg_rows': 0, 'mysql_rows': 0,
-                    'changes': 0, 'inconsistent': 0
-                }
-
-            stats = schema_stats[table.schema_name]
-            stats['count'] += 1
-            stats['pg_rows'] += table.pg_rows
-            stats['mysql_rows'] += table.mysql_rows
-            stats['changes'] += table.change
-            if not table.is_consistent:
-                stats['inconsistent'] += 1
-
-        # 一致性统计
-        consistent_count = len([t for t in tables if t.is_consistent])
-        inconsistent_count = len(tables) - consistent_count
-
-        # 统一的统计信息
-        stats_text = Text()
-        # 第二行：数据量统计
-        stats_text.append(f"📈 PG总计: ", style="normal")  # 标签 - 黑色
-        stats_text.append(f"{total_pg_rows:,}", style="dim_text")  # PG总数 - 浅色
-        stats_text.append(f" 行, MySQL总计: ", style="normal")  # 标签 - 黑色
-        stats_text.append(f"{total_mysql_rows:,}", style="normal")  # MySQL总数 - 正常色
-        stats_text.append(f" 行, ", style="normal")
-
-        # 数据差异颜色语义化
-        diff_style = "inconsistent" if total_diff < 0 else "consistent" if total_diff > 0 else "normal"
-        stats_text.append(f"数据差异: {total_diff:+,} 行\n", style=diff_style)
-
-        # 第三行：变化和一致性统计
-        change_style = "consistent" if total_changes > 0 else "inconsistent" if total_changes < 0 else "normal"
-        stats_text.append(f"🔄 本轮变化: {total_changes:+,} 行 ({changed_count} 个表有变化), ", style=change_style)
-
-        stats_text.append(f"一致性: ", style="normal")
-        stats_text.append(f"{consistent_count} 个一致", style="consistent")  # 一致状态 - 绿色粗体
-        if inconsistent_count > 0:
-            stats_text.append(f", {inconsistent_count} 个不一致", style="inconsistent")  # 不一致 - 红色粗体
-        if len(error_tables) > 0:
-            stats_text.append(f", {len(error_tables)} 个错误", style="error")  # 错误 - 红色粗体
-
-        # 显示更新状态
-        mysql_updating_count = sum(1 for t in tables if t.mysql_updating)
-        active_mysql_futures = len([f for f in self.mysql_update_tasks if not f.done()])
-        
-        pg_updating_count = sum(1 for t in tables if t.pg_updating)
-        active_pg_futures = len([f for f in self.pg_update_tasks if not f.done()])
-
-        # PostgreSQL更新状态
-        if pg_updating_count > 0 or active_pg_futures > 0:
-            stats_text.append(f", PG更新中: {pg_updating_count} 个表, {active_pg_futures} 个任务", style="updating")  # 更新中 - 黄色粗体
-
-        # MySQL更新状态
-        if mysql_updating_count > 0 or active_mysql_futures > 0:
-            stats_text.append(f", MySQL更新中: {mysql_updating_count} 个表, {active_mysql_futures} 个任务",
-                              style="updating")  # 更新中 - 黄色粗体
-
-        # 显示详细的Schema统计
-        stats_text.append("\n📋 Schema详情: ", style="info")  # 子标题 - 亮蓝色
-        for i, (schema_name, stats) in enumerate(sorted(schema_stats.items())):
-            if i > 0:
-                stats_text.append(" | ", style="dim_text")  # 分隔符 - 暗灰色
-
-            # Schema名称和基本信息
-            stats_text.append(f"{schema_name}: ", style="schema_name")  # Schema名 - 洋红色
-            stats_text.append(f"{stats['count']}表 ", style="normal")  # 表数量 - 黑色
-
-            # 数据差异颜色语义化
-            schema_diff = stats['pg_rows'] - stats['mysql_rows']
-            diff_style = "inconsistent" if schema_diff < 0 else "consistent" if schema_diff > 0 else "info"
-            stats_text.append(f"差异{schema_diff:+,} ", style=diff_style)
-
-            # 不一致表数量
-            if stats['inconsistent'] > 0:
-                stats_text.append(f"({stats['inconsistent']}不一致)", style="inconsistent")  # 不一致 - 红色粗体
-
-        combined_content = stats_text
-        return Panel(combined_content, title="监控统计", box=box.ROUNDED, style="stats_border")
-
-    def create_footer_panel(self, tables: List[TableInfo]) -> Panel:
-        """创建底部面板"""
-        consistent_count = len([t for t in tables if t.is_consistent])
-        inconsistent_count = len(tables) - consistent_count
-
-        footer_text = Text()
-
-        # 第一行：进度条
-        # 过滤掉错误状态的表进行统计
-        valid_tables = [t for t in tables if t.pg_rows != -1 and t.mysql_rows != -1]
-
-        if valid_tables:
-            total_pg_rows = sum(t.pg_rows for t in valid_tables)
-            total_mysql_rows = sum(t.mysql_rows for t in valid_tables)
-
-            # 计算完成百分比 - PostgreSQL追赶MySQL的进度
-            if total_mysql_rows > 0:
-                # 修改计算逻辑，确保进度条准确反映同步进度
-                completion_rate = min(total_pg_rows / total_mysql_rows, 1.0)
-            else:
-                completion_rate = 1.0 if total_pg_rows == 0 else 0.0
-
-            completion_percent = completion_rate * 100
-
-            # 计算速度
-            speed = self.calculate_sync_speed()
-
-            # 估算剩余时间
-            remaining_time = self.estimate_remaining_time(total_mysql_rows, total_pg_rows, speed)
-
-            # 创建进度条 - 根据完成度使用不同颜色
-            bar_width = 25  # 稍微小一点以适应底部面板
-            filled_width = int(bar_width * completion_rate)
-            empty_width = bar_width - filled_width
-
-            # 进度条颜色语义化：根据完成率选择颜色
-            if completion_rate >= 0.8:
-                progress_color = "consistent"  # 80%以上 - 绿色粗体
-            elif completion_rate >= 0.6:
-                progress_color = "updating"  # 60-80% - 黄色粗体
-            else:
-                progress_color = "inconsistent"  # 60%以下 - 红色粗体
-
-            footer_text.append("📊 同步进度: ", style="info")  # 标题 - 亮蓝色
-            footer_text.append("█" * filled_width, style=progress_color)  # 已完成部分
-            footer_text.append("░" * empty_width, style="dim_text")  # 未完成部分 - 暗灰色
-            footer_text.append(f" {completion_percent:.1f}%", style="info")  # 百分比 - 亮蓝色
-            footer_text.append(f" (", style="normal")  # 括号 - 黑色
-            footer_text.append(f"{total_pg_rows:,}", style="dim_text")  # PG总数 - 浅色
-            footer_text.append(f"/", style="normal")  # 分隔符 - 黑色
-            footer_text.append(f"{total_mysql_rows:,}", style="normal")  # MySQL总数 - 正常色
-            footer_text.append(f")", style="normal")  # 括号 - 黑色
-
-            # 速度和预估时间
-            if speed > 0:
-                footer_text.append(f" | 速度: {speed:.1f} 记录/秒", style="speed")  # 速度 - 亮蓝色
-            else:
-                footer_text.append(" | 速度: 计算中...", style="dim_text")  # 计算中 - 暗灰色
-
-            if speed > 0 and total_mysql_rows > total_pg_rows:
-                footer_text.append(f" | 预估: {remaining_time}", style="estimate")  # 预估时间 - 暗蓝色
-            elif total_pg_rows >= total_mysql_rows:
-                footer_text.append(" | 状态: 已完成", style="consistent")  # 完成状态 - 绿色粗体
-            else:
-                footer_text.append(" | 预估: 计算中...", style="dim_text")  # 计算中 - 暗灰色
-
-            footer_text.append("\n")
-        else:
-            footer_text.append("📊 同步进度: ", style="info")  # 标题 - 亮蓝色
-            footer_text.append("等待数据...\n", style="dim_text")  # 等待提示 - 暗灰色
-
-        # 第二行：数据一致性统计
-        footer_text.append("🔍 数据一致性: ", style="dim_text")  # 标题 - 暗灰色
-        footer_text.append(f"{consistent_count} 个表一致, ", style="consistent")  # 一致状态 - 绿色粗体
-        footer_text.append(f"{inconsistent_count} 个表不一致 ", style="inconsistent")  # 不一致 - 红色粗体
-        
-        # 计算总页数
-        total_pages = (len(tables) + self.page_size - 1) // self.page_size
-        start_idx = (self.current_page - 1) * self.page_size
-        end_idx = min(start_idx + self.page_size, len(tables))
-
-        # 添加翻页倒计时进度条
-        if total_pages > 1:  # 只有多于一页时才显示进度条
-            footer_text.append("\n")
-            countdown_progress = self.create_countdown_progress()
-            footer_text.append(countdown_progress)
-            footer_text.append(f" ({self.current_page}/{total_pages}页)", style="dim_text")
-            footer_text.append(f"(显示第{start_idx + 1}-{end_idx}/{len(tables)}条记录)", style="normal")  # 统计信息 - 黑色
-
-        # 第三行：操作提示
-        footer_text.append("\n💡 按 Ctrl+C 停止监控", style="warning")  # 操作提示 - 黄色粗体
-
-        return Panel(footer_text, box=box.ROUNDED, style="footer_border")
-
-    def create_layout(self, tables: List[TableInfo]) -> Layout:
-        """创建布局"""
-        layout = Layout()
-
-        layout.split_column(
-            Layout(self.create_header_panel(), size=3),
-            Layout(self.create_combined_stats_panel(tables), size=4),
-            Layout(self.create_tables_table(tables), name="tables"),
-            Layout(self.create_footer_panel(tables), size=6)
-        )
-
-        return layout
-
-    async def run(self):
-        """运行监控"""
-        if not self.load_config():
-            return
-
-        self.console.print("[green]正在启动PostgreSQL监控程序...[/green]")
-
-        # 初始化数据库连接测试
-        pg_conn = await self.connect_postgresql()
-        if not pg_conn:
-            return
-        await pg_conn.close()
-
-        self.console.print(f"[green]配置的MySQL数据库: {', '.join(self.mysql_config.databases)}[/green]")
-        self.console.print(f"[green]开始监控，PG刷新间隔: {self.monitor_config['refresh_interval']} 秒[/green]")
-        self.console.print(
-            f"[green]MySQL更新间隔: {self.mysql_update_interval} 次PG更新 (异步执行，不阻塞PG查询)[/green]")
-
-        # 初始化表结构 - 显示进度提示
-        self.console.print("[yellow]正在初始化表结构，请稍候...[/yellow]")
 
         with self.console.status("[bold green]正在从MySQL获取表信息...") as status:
             target_tables = await self.initialize_tables_from_mysql()
@@ -1165,254 +1231,13 @@ class PostgreSQLMonitor:
                     pass
             self.console.print("[green]资源清理完成[/green]")
 
-    def update_progress_data(self, tables: List[TableInfo]):
-        """更新进度数据，计算总数和变化量"""
-        current_time = datetime.now()
 
-        # 过滤掉错误状态的表进行统计
-        valid_tables = [t for t in tables if t.pg_rows != -1 and t.mysql_rows != -1]
-
-        total_pg_rows = sum(t.pg_rows for t in valid_tables)
-        total_mysql_rows = sum(t.mysql_rows for t in valid_tables)
-        total_pg_change = sum(t.change for t in valid_tables)
-
-        # 添加到历史数据
-        self.history_data.append((current_time, total_pg_rows, total_mysql_rows, total_pg_change))
-
-        # 保持历史数据在指定范围内
-        if len(self.history_data) > self.max_history_points:
-            self.history_data.pop(0)
-
-    def calculate_sync_speed(self) -> float:
-        """计算同步速度（记录/秒）"""
-        if len(self.history_data) < 2:
-            return 0.0
-
-        # 使用最近的数据点计算速度
-        recent_data = self.history_data[-min(10, len(self.history_data)):]
-
-        if len(recent_data) < 2:
-            return 0.0
-
-        # 计算时间跨度和总变化量
-        time_span = (recent_data[-1][0] - recent_data[0][0]).total_seconds()
-        if time_span <= 0:
-            return 0.0
-
-        # 计算PostgreSQL总变化量（所有数据点的变化量之和）
-        total_change = sum(data[3] for data in recent_data if data[3] > 0)  # 只计算正向变化
-
-        return total_change / time_span if time_span > 0 else 0.0
-
-    def estimate_remaining_time(self, mysql_total: int, pg_total: int, speed: float) -> str:
-        """估算剩余时间"""
-        if speed <= 0 or mysql_total <= 0:
-            return "无法估算"
-
-        # 计算还需要同步的记录数
-        remaining_records = mysql_total - pg_total
-        if remaining_records <= 0:
-            return "已完成"
-
-        remaining_seconds = remaining_records / speed
-
-        if remaining_seconds < 60:
-            return f"{int(remaining_seconds)}秒"
-        elif remaining_seconds < 3600:
-            minutes = int(remaining_seconds // 60)
-            seconds = int(remaining_seconds % 60)
-            return f"{minutes}分{seconds}秒"
-        elif remaining_seconds < 86400:
-            hours = int(remaining_seconds // 3600)
-            minutes = int((remaining_seconds % 3600) // 60)
-            return f"{hours}小时{minutes}分钟"
-        else:
-            days = int(remaining_seconds // 86400)
-            hours = int((remaining_seconds % 86400) // 3600)
-            return f"{days}天{hours}小时"
-
-    def format_duration(self, seconds: float) -> str:
-        """格式化时长显示"""
-        if seconds < 60:
-            return f"{int(seconds)}秒"
-        elif seconds < 3600:
-            minutes = int(seconds // 60)
-            secs = int(seconds % 60)
-            return f"{minutes}分{secs}秒"
-        elif seconds < 86400:
-            hours = int(seconds // 3600)
-            minutes = int((seconds % 3600) // 60)
-            return f"{hours}小时{minutes}分钟"
-        else:
-            days = int(seconds // 86400)
-            hours = int((seconds % 86400) // 3600)
-            return f"{days}天{hours}小时"
-
-    def create_tables_table(self, tables: List[TableInfo]) -> Table:
-        """创建表格"""
-
-        # 按schema名和表名排序
-        sorted_tables = sorted(tables, key=lambda t: (t.schema_name, t.target_table_name))
-        
-        # 计算当前页的表格范围
-        start_idx = (self.current_page - 1) * self.page_size
-        end_idx = start_idx + self.page_size
-        display_tables = sorted_tables[start_idx:end_idx]
-
-        table = Table(box=box.ROUNDED, show_header=True, header_style="table_header")
-        table.add_column("序号", justify="right", style="dim_text", width=4)
-        table.add_column("状态", justify="center", width=4)
-        table.add_column("SCHEMA", style="schema_name", width=8)  # Schema名 - 洋红色
-        table.add_column("目标表名", style="table_name", width=40)  # 表名 - 蓝色
-        table.add_column("PG记录数", justify="right", style="normal", width=12)  # 数据计数 - 黑色
-        table.add_column("MySQL汇总数", justify="right", style="normal", width=12)  # 数据计数 - 黑色
-        table.add_column("数据差异", justify="right", width=10)  # 差异 - 根据状态动态着色
-        table.add_column("变化量", justify="center", width=12)  # 变化 - 根据状态动态着色
-        table.add_column("PG更新时间", justify="center", style="dim_text", width=10)  # 时间戳 - 暗灰色
-        table.add_column("MySQL状态", justify="center", style="dim_text", width=12)  # 状态 - 暗灰色
-        table.add_column("源表数量", style="dim_text", width=8)  # 次要信息 - 暗灰色
-
-        for i, t in enumerate(display_tables, start_idx + 1):
-
-            # 图标选择 - 包含错误状态
-            if t.pg_rows == -1 or t.mysql_rows == -1:
-                icon = "❌"  # 查询错误
-            elif t.is_consistent:
-                icon = "✅"  # 数据一致
-            else:
-                icon = "⚠️"  # 数据不一致
-
-            # 截断长名称
-            schema_name = t.schema_name[:13] + "..." if len(t.schema_name) > 15 else t.schema_name
-            # 现在图标单独一列，表名可以显示更多字符
-            table_name = t.target_table_name
-
-            # 数据差异样式 - 处理错误状态
-            if t.pg_rows == -1 or t.mysql_rows == -1:
-                diff_style = "error"
-                diff_text = "ERROR"
-            else:
-                # 负数(PG少了)=红色警告, 正数(PG多了)=黄色提醒, 0=正常
-                diff_style = "inconsistent" if t.data_diff < 0 else "warning" if t.data_diff > 0 else "unchanged"
-                diff_text = f"{t.data_diff:+,}" if t.data_diff != 0 else "0"
-
-            # 变化量样式 - 处理错误状态
-            if t.pg_rows == -1:
-                change_text = "ERROR"
-                change_style = "error"
-            elif t.change > 0:
-                change_text = f"+{t.change:,} ⬆"
-                change_style = "consistent"
-            elif t.change < 0:
-                change_text = f"{t.change:,} ⬇"
-                change_style = "inconsistent"
-            else:
-                change_text = "0 ─"
-                change_style = "unchanged"
-
-            # MySQL源表数量显示
-            source_count = len(t.mysql_source_tables)
-            source_display = str(source_count)
-
-            # MySQL状态显示 - 与PG更新时间列颜色逻辑保持一致
-            if t.mysql_updating:
-                mysql_status = "[updating]更新中[/updating]"  # 更新中 - 黄色粗体
-            else:
-                mysql_relative_time = self.get_relative_time(t.mysql_last_updated)
-                if "年前" in mysql_relative_time or "个月前" in mysql_relative_time:
-                    mysql_status = "[error]未更新[/error]"  # 未更新 - 红色粗体
-                else:
-                    mysql_status = f"[dim_text]{mysql_relative_time}[/dim_text]"  # 已更新 - 与PG时间列一致的暗灰色
-
-            # 处理记录数显示 - 估计值用暗色标识
-            if t.pg_rows == -1:
-                pg_rows_display = "ERROR"
-            elif t.pg_is_estimated:
-                pg_rows_display = f"~{t.pg_rows:,}"  # ~符号表示估计值
-            else:
-                pg_rows_display = f"{t.pg_rows:,}"
-
-            if t.mysql_rows == -1:
-                mysql_rows_display = "ERROR"
-            elif t.mysql_is_estimated:
-                mysql_rows_display = f"~{t.mysql_rows:,}"  # ~符号表示估计值
-            else:
-                mysql_rows_display = f"{t.mysql_rows:,}"
-
-            table.add_row(
-                str(i),
-                icon,
-                schema_name,
-                table_name,
-                f"[error]{pg_rows_display}[/error]" if t.pg_rows == -1 else pg_rows_display,
-                f"[error]{mysql_rows_display}[/error]" if t.mysql_rows == -1 else mysql_rows_display,
-                f"[{diff_style}]{diff_text}[/{diff_style}]",
-                f"[{change_style}]{change_text}[/{change_style}]",
-                self.get_relative_time(t.last_updated),
-                mysql_status,
-                source_display
-            )
-
-        return table
-
-    async def countdown_timer(self):
-        """倒计时更新任务"""
-        while not self.stop_event.is_set():
-            try:
-                # 重置倒计时
-                self.remaining_seconds = self.page_interval
-                
-                # 每秒更新倒计时
-                while self.remaining_seconds > 0 and not self.stop_event.is_set():
-                    await asyncio.sleep(1)
-                    self.remaining_seconds -= 1
-                    
-                # 如果不是因为停止信号而结束，则触发翻页
-                if not self.stop_event.is_set():
-                    # 计算总页数
-                    total_pages = (len(self.tables) + self.page_size - 1) // self.page_size if self.tables else 1
-                    # 更新页码，确保不超过总页数
-                    self.current_page = (self.current_page % total_pages) + 1
-                    self.last_page_change = datetime.now()
-            except Exception as e:
-                if not self.stop_event.is_set():
-                    self.console.print(f"[red]倒计时更新出错: {e}[/red]")
-                    await asyncio.sleep(1)
-
-    def create_countdown_progress(self) -> Text:
-        """创建倒计时进度条"""
-        progress_text = Text()
-        
-        # 计算进度
-        progress_ratio = self.remaining_seconds / self.page_interval
-        
-        # 进度条参数
-        bar_width = 20  # 进度条宽度
-        filled_width = int(bar_width * progress_ratio)
-        empty_width = bar_width - filled_width
-        
-        # 根据剩余时间设置颜色
-        if progress_ratio > 0.6:
-            bar_color = "info"  # 剩余时间充足 - 蓝色
-        elif progress_ratio > 0.3:
-            bar_color = "warning"  # 剩余时间中等 - 黄色
-        else:
-            bar_color = "error"  # 剩余时间不多 - 红色
-        
-        # 绘制进度条
-        progress_text.append("📄 翻页进度: ", style="dim_text")
-        progress_text.append("█" * filled_width, style=bar_color)  # 已过时间
-        progress_text.append("░" * empty_width, style="dim_text")  # 剩余时间
-        progress_text.append(f" {int(self.remaining_seconds)}秒后翻页", style=bar_color)
-        
-        return progress_text
 
 
 def main():
     """主函数"""
-    # 解析命令行参数
     parser = argparse.ArgumentParser(
-        description="PostgreSQL数据库监控工具 (异步版本)",
+        description="PostgreSQL数据库监控工具 (Textual版本)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
@@ -1420,6 +1245,15 @@ def main():
   python3 cdc_monitor.py --databases db1,db2     # 监控指定的数据库
   python3 cdc_monitor.py -d test_db               # 只监控test_db数据库
   python3 cdc_monitor.py --config my_config.ini  # 使用指定的配置文件
+
+快捷键:
+  q/Ctrl+C : 退出程序
+  r        : 手动刷新数据
+  space    : 暂停/继续监控
+  s        : 切换排序方式 (Schema.表名 → 数据差异 → PG记录数 → MySQL记录数)
+  f        : 切换过滤方式 (全部 → 不一致 → 一致 → 错误)
+  方向键   : 移动光标浏览表格
+  Page Up/Down : 快速翻页
         """
     )
 
@@ -1448,14 +1282,13 @@ def main():
     # 处理数据库列表参数
     override_databases = None
     if args.databases:
-        # 去除空格并分割数据库名称
         override_databases = [db.strip() for db in args.databases.split(',') if db.strip()]
         if not override_databases:
             print("❌ 指定的数据库列表为空")
             sys.exit(1)
 
-    monitor = PostgreSQLMonitor(config_file, override_databases)
-    asyncio.run(monitor.run())
+    app = MonitorApp(config_file, override_databases)
+    app.run()
 
 
 if __name__ == "__main__":
