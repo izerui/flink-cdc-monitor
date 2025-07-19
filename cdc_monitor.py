@@ -587,7 +587,7 @@ class MonitorApp(App[None]):
                 
             # MySQL更新时间和样式 - 与PG更新时间保持一致
             if t.mysql_updating:
-                mysql_status = "[bold bright_yellow]更新中[/]"
+                mysql_status = "[yellow3]更新中[/]"  # 使用更温和的深黄色
             else:
                 mysql_relative_time = self.get_relative_time(t.mysql_last_updated)
                 if "年前" in mysql_relative_time or "个月前" in mysql_relative_time:
@@ -618,9 +618,9 @@ class MonitorApp(App[None]):
             schema_display = f"[bold medium_purple3]{t.schema_name[:12] + '...' if len(t.schema_name) > 15 else t.schema_name}[/]"  # Schema用中紫色
             table_display = f"[bold dodger_blue2]{t.target_table_name[:35] + '...' if len(t.target_table_name) > 38 else t.target_table_name}[/]"  # 表名用道奇蓝色
             
-            # PG更新时间样式 - 区分更新状态
+            # PG更新时间样式 - 区分更新状态，使用更温和的颜色
             if t.pg_updating:
-                pg_time_display = "[bold bright_yellow]更新中[/]"
+                pg_time_display = "[yellow3]更新中[/]"  # 使用更温和的深黄色
             else:
                 pg_relative_time = self.get_relative_time(t.last_updated)
                 if "年前" in pg_relative_time or "个月前" in pg_relative_time:
@@ -1021,16 +1021,22 @@ class MonitorApp(App[None]):
                             table_info.mysql_updating = False
                             table_info.mysql_is_estimated = True  # 标记为估计值
                 else:
-                    # 常规更新使用精确的COUNT查询
+                    # 常规更新使用精确的COUNT查询 - 优化显示逻辑
+                    # 首先标记所有表为更新中状态
+                    async with self.mysql_update_lock:
+                        for table_info in tables_dict.values():
+                            if not table_info.mysql_updating:
+                                table_info.mysql_updating = True
+                    
+                    # 然后逐个处理表
                     for table_info in tables_dict.values():
                         # 检查停止标志
                         if self.stop_event.is_set():
+                            # 恢复所有表的状态
+                            async with self.mysql_update_lock:
+                                for ti in tables_dict.values():
+                                    ti.mysql_updating = False
                             return False
-
-                        async with self.mysql_update_lock:
-                            if table_info.mysql_updating:
-                                continue  # 如果正在更新中，跳过
-                            table_info.mysql_updating = True
 
                         # 在锁外执行查询以避免长时间锁定
                         temp_mysql_rows = 0
@@ -1040,7 +1046,8 @@ class MonitorApp(App[None]):
                             # 检查停止标志
                             if self.stop_event.is_set():
                                 async with self.mysql_update_lock:
-                                    table_info.mysql_updating = False
+                                    for ti in tables_dict.values():
+                                        ti.mysql_updating = False
                                 return False
 
                             try:
@@ -1171,16 +1178,22 @@ class MonitorApp(App[None]):
                 return False
 
             try:
-                # 常规更新使用精确的COUNT查询
+                # 常规更新使用精确的COUNT查询 - 优化显示逻辑  
+                # 首先标记所有表为更新中状态
+                async with self.pg_update_lock:
+                    for table_info in tables_dict.values():
+                        if not table_info.pg_updating:
+                            table_info.pg_updating = True
+                
+                # 然后逐个处理表
                 for target_table_name, table_info in tables_dict.items():
                     # 检查停止标志
                     if self.stop_event.is_set():
+                        # 恢复所有表的状态
+                        async with self.pg_update_lock:
+                            for ti in tables_dict.values():
+                                ti.pg_updating = False
                         return False
-
-                    async with self.pg_update_lock:
-                        if table_info.pg_updating:
-                            continue  # 如果正在更新中，跳过
-                        table_info.pg_updating = True
 
                     # 在锁外执行查询以避免长时间锁定
                     try:
