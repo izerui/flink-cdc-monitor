@@ -552,7 +552,7 @@ class MonitorApp(App[None]):
             else:
                 icon = "⚠️"
                 
-            # 数据差异文本和样式 - 使用更温和的颜色
+            # 数据差异文本和样式 - 零值与变化量保持一致
             if t.pg_rows == -1 or t.mysql_rows == -1:
                 diff_text = "[bold bright_red]ERROR[/]"  # 错误状态用亮红色
             else:
@@ -560,33 +560,33 @@ class MonitorApp(App[None]):
                 if t.data_diff < 0:
                     diff_text = f"[bold orange3]{t.data_diff:+,}[/]"  # 负数用橙色（PG落后）
                 elif t.data_diff > 0:
-                    diff_text = f"[bold spring_green3]{t.data_diff:+,}[/]"  # 正数用春绿色（PG领先）
+                    diff_text = f"[bold bright_green]{t.data_diff:+,}[/]"  # 正数用亮绿色（PG领先）
                 else:
-                    diff_text = "[bold bright_white]0[/]"  # 零用亮白色（完全一致）
+                    diff_text = "[dim white]0[/]"  # 零用暗白色（与变化量一致）
                 
-            # 变化量文本和样式 - 更柔和的变化指示
+            # 变化量文本和样式 - 去掉无变化时的横线
             if t.pg_rows == -1:
                 change_text = "[bold bright_red]ERROR[/]"
             elif t.change > 0:
-                change_text = f"[bold bright_green]+{t.change:,} ⬆[/]"  # 增加用亮绿色
+                change_text = f"[bold spring_green3]+{t.change:,} ⬆[/]"  # 增加用春绿色
             elif t.change < 0:
-                change_text = f"[bold purple]{t.change:,} ⬇[/]"  # 减少用紫色（比红色温和）
+                change_text = f"[bold orange3]{t.change:,} ⬇[/]"  # 减少用橙色
             else:
-                change_text = "[dim white]0 ─[/]"  # 无变化用暗白色
+                change_text = "[dim white]0[/]"  # 无变化只显示0，与数据差异保持一致
                 
-            # MySQL更新时间和样式
+            # MySQL更新时间和样式 - 与PG更新时间保持一致
             if t.mysql_updating:
                 mysql_status = "[bold bright_yellow]更新中[/]"
             else:
-                relative_time = self.get_relative_time(t.mysql_last_updated)
-                if "年前" in relative_time or "个月前" in relative_time:
-                    mysql_status = f"[bold orange1]{relative_time}[/]"  # 很久没更新用橙色
-                elif "天前" in relative_time:
-                    mysql_status = f"[bold yellow3]{relative_time}[/]"  # 几天前用深黄色  
-                elif "小时前" in relative_time:
-                    mysql_status = f"[bright_cyan]{relative_time}[/]"  # 几小时前用亮青色
+                mysql_relative_time = self.get_relative_time(t.mysql_last_updated)
+                if "年前" in mysql_relative_time or "个月前" in mysql_relative_time:
+                    mysql_status = f"[bold orange1]{mysql_relative_time}[/]"  # 很久没更新用橙色
+                elif "天前" in mysql_relative_time:
+                    mysql_status = f"[bold yellow3]{mysql_relative_time}[/]"  # 几天前用深黄色
+                elif "小时前" in mysql_relative_time:
+                    mysql_status = f"[bright_cyan]{mysql_relative_time}[/]"  # 几小时前用亮青色
                 else:
-                    mysql_status = f"[dim bright_white]{relative_time}[/]"  # 最近更新用暗亮白色
+                    mysql_status = f"[dim bright_black]{mysql_relative_time}[/]"  # 最近更新用暗色（与PG一致）
                 
             # 记录数显示和样式 - 区分估计值和精确值
             if t.pg_rows == -1:
@@ -621,8 +621,16 @@ class MonitorApp(App[None]):
                 else:
                     pg_time_display = f"[dim bright_black]{pg_relative_time}[/]"  # 最近更新用暗色
             
-            # 源表数量样式
-            source_count_display = f"[dim bright_black]{len(t.mysql_source_tables)}[/]"  # 用亮黑色（灰色）
+            # 源表数量样式 - 使用原来MySQL更新时间的颜色方案
+            source_count = len(t.mysql_source_tables)
+            if source_count >= 5:
+                source_count_display = f"[bold orange1]{source_count}[/]"  # 源表多用橙色
+            elif source_count >= 3:
+                source_count_display = f"[bold yellow3]{source_count}[/]"  # 中等数量用深黄色
+            elif source_count >= 2:
+                source_count_display = f"[bright_cyan]{source_count}[/]"  # 少量用亮青色
+            else:
+                source_count_display = f"[dim bright_white]{source_count}[/]"  # 单表用暗亮白色
             
             # 添加行到表格
             table.add_row(
